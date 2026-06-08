@@ -2616,6 +2616,8 @@ def _is_model_not_found_error(exc: Exception) -> bool:
 
 def _evict_cached_clients(provider: str) -> None:
     """Drop cached auxiliary clients for a provider so fresh creds are used."""
+    import inspect
+
     normalized = _normalize_aux_provider(provider)
     with _client_cache_lock:
         stale_keys = [
@@ -2628,7 +2630,7 @@ def _evict_cached_clients(provider: str) -> None:
                 _force_close_async_httpx(client)
                 try:
                     close_fn = getattr(client, "close", None)
-                    if callable(close_fn):
+                    if callable(close_fn) and not inspect.iscoroutinefunction(close_fn):
                         close_fn()
                 except Exception:
                     pass

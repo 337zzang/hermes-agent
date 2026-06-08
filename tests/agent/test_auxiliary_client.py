@@ -3194,6 +3194,41 @@ class TestAuxiliaryClientPoisonedCacheEviction:
             with _client_cache_lock:
                 _client_cache.clear()
 
+    def test_evict_cached_clients_skips_async_close_runtime_warning(self):
+        """Provider eviction must not call async ``close()`` from sync code."""
+        import gc
+        import warnings
+
+        from agent.auxiliary_client import (
+            _client_cache, _client_cache_lock, _evict_cached_clients,
+        )
+
+        class AsyncCloseClient:
+            async def close(self):
+                pass
+
+        cache_key = ("openai-codex", True, None, None, None)
+        with _client_cache_lock:
+            _client_cache.clear()
+            _client_cache[cache_key] = (AsyncCloseClient(), "gpt-5.5", None)
+
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", RuntimeWarning)
+                _evict_cached_clients("openai-codex")
+                gc.collect()
+
+            unawaited = [
+                warning for warning in caught
+                if issubclass(warning.category, RuntimeWarning)
+                and "was never awaited" in str(warning.message)
+            ]
+            assert unawaited == []
+            assert cache_key not in _client_cache
+        finally:
+            with _client_cache_lock:
+                _client_cache.clear()
+
 
 # ---------------------------------------------------------------------------
 # _build_call_kwargs — tool dedup at API boundary
