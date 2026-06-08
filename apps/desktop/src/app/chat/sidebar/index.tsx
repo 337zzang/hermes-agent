@@ -39,8 +39,8 @@ import { Tip } from '@/components/ui/tooltip'
 import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { profileColor } from '@/lib/profile-color'
-import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { sessionMatchesSearch } from '@/lib/session-search'
+import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
 import { $cronJobs } from '@/store/cron'
 import {
@@ -126,8 +126,10 @@ const GROUP_DND_ID_PREFIX = 'group:'
 const LOCAL_SESSION_SOURCES = new Set(['cli', 'desktop', 'local', 'tui'])
 
 const groupDndId = (id: string) => `${GROUP_DND_ID_PREFIX}${id}`
+
 const parseGroupDndId = (id: string) =>
   id.startsWith(GROUP_DND_ID_PREFIX) ? id.slice(GROUP_DND_ID_PREFIX.length) : null
+
 const countLabel = (loaded: number, total: number) => (total > loaded ? `${loaded}/${total}` : String(loaded))
 const sessionTime = (s: SessionInfo) => s.last_active || s.started_at || 0
 
@@ -265,6 +267,7 @@ function sourceSessionGroupsFor(sessions: SessionInfo[]): {
     }
 
     const label = sessionSourceLabel(sourceId) ?? sourceId
+
     const group = groups.get(sourceId) ?? {
       id: `source:${sourceId}`,
       label,
