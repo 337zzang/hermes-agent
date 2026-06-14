@@ -265,6 +265,50 @@ class TestGoalAutoStartPolicy:
         assert should_auto_start_goal_from_text("What time is it?") is False
         assert should_auto_start_goal_from_text("yes") is False
 
+    def test_auto_start_rejects_non_string_and_empty(self):
+        from hermes_cli.goals import should_auto_start_goal_from_text
+
+        assert should_auto_start_goal_from_text(None) is False
+        assert should_auto_start_goal_from_text(123) is False
+        assert should_auto_start_goal_from_text(["fix it"]) is False
+        assert should_auto_start_goal_from_text("") is False
+        assert should_auto_start_goal_from_text("   ") is False
+
+    def test_auto_start_rejects_short_acks_all_variants(self):
+        """Every ack token (case-insensitive, EN + KO) is rejected."""
+        from hermes_cli.goals import should_auto_start_goal_from_text
+
+        for ack in ("yes", "YES", "Ok", "네", "예", "응", "아니요", "승인", "확인", "approve", "deny"):
+            assert should_auto_start_goal_from_text(ack) is False, ack
+
+    def test_auto_start_verb_question_still_triggers(self):
+        """A question that contains an agentic verb still auto-starts — the
+        short-question guard only suppresses verb-LESS short questions."""
+        from hermes_cli.goals import should_auto_start_goal_from_text
+
+        assert should_auto_start_goal_from_text("Can you fix the login bug?") is True
+
+    def test_auto_start_verbless_question_rejected_regardless_of_length(self):
+        """Verb-less questions never auto-start; the 160-char threshold does not
+        flip the result (the agentic-verb check dominates) — guards against a
+        behavior change if that branch is ever made significant."""
+        from hermes_cli.goals import should_auto_start_goal_from_text
+
+        short_q = "a" * 158 + "?"   # 159 chars, no agentic verb
+        long_q = "a" * 159 + "?"    # 160 chars, no agentic verb
+        assert len(short_q) == 159 and len(long_q) == 160
+        assert should_auto_start_goal_from_text(short_q) is False
+        assert should_auto_start_goal_from_text(long_q) is False
+
+    def test_auto_start_korean_question_with_verb_is_known_quirk(self):
+        """Current behavior: a Korean question containing an agentic verb
+        ('확인') auto-starts even though it reads as a question. This is a known
+        quirk the config-driven classifier (plan P14) is meant to address; the
+        test pins today's behavior so that future change is intentional."""
+        from hermes_cli.goals import should_auto_start_goal_from_text
+
+        assert should_auto_start_goal_from_text("버그 가능성 확인 가능?") is True
+
 
 # ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence
