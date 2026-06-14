@@ -540,6 +540,21 @@ class TestGoalManager:
         assert prompt is not None
         assert "port goal command to hermes" in prompt
         assert prompt.strip()  # non-empty
+        # No judge feedback yet (goal just set) → no feedback line.
+        assert "Last review feedback" not in prompt
+
+    def test_continuation_prompt_includes_last_judge_reason(self, hermes_home):
+        """The continuation carries the judge's last feedback so the next turn
+        knows what was missing (mirrors the kanban continuation)."""
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="cont-reason")
+        mgr.set("ship the feature")
+        mgr.state.last_reason = "tests are still failing"
+        prompt = mgr.next_continuation_prompt()
+        assert prompt is not None
+        assert "Last review feedback: tests are still failing" in prompt
+        assert "ship the feature" in prompt
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1076,3 +1091,42 @@ class TestParseResumeFlags:
         from hermes_cli.goals import parse_resume_flags
 
         assert parse_resume_flags("--whatever") == (True, None)
+
+
+class TestGoalStatePersistence:
+    """Round-trip + fail-safe guards for the /resume persistence backbone."""
+
+    def test_goalstate_full_roundtrip(self):
+        from hermes_cli.goals import GoalState
+
+        st = GoalState(
+            goal="ship it",
+            status="paused",
+            turns_used=4,
+            max_turns=12,
+            created_at=111.0,
+            last_turn_at=222.0,
+            last_verdict="continue",
+            last_reason="needs tests",
+            paused_reason="turn budget exhausted (12/12)",
+            consecutive_parse_failures=2,
+            subgoals=["a", "b"],
+        )
+        assert GoalState.from_json(st.to_json()) == st
+
+    def test_load_goal_returns_none_on_corrupt_row(self, hermes_home):
+        from hermes_cli import goals
+
+        db = goals._get_session_db()
+        assert db is not None
+        db.set_meta(goals._meta_key("corrupt-sid"), "{not valid json")
+        assert goals.load_goal("corrupt-sid") is None
+
+    def test_module_clear_goal_marks_cleared(self, hermes_home):
+        from hermes_cli import goals
+
+        goals.save_goal("clr-sid", goals.GoalState(goal="do x"))
+        goals.clear_goal("clr-sid")
+        loaded = goals.load_goal("clr-sid")
+        assert loaded is not None
+        assert loaded.status == "cleared"

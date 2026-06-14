@@ -917,11 +917,23 @@ class GoalManager:
         if not self._state or self._state.status != "active":
             return None
         if self._state.subgoals:
-            return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
+            prompt = CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
                 goal=self._state.goal,
                 subgoals_block=self._state.render_subgoals_block(),
             )
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        else:
+            prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        # Carry the judge's last feedback into the next turn so the agent knows
+        # what was found lacking (the kanban loop already does this). last_reason
+        # is the deterministic (temperature=0) judge verdict — safe to inject as
+        # a plain user-role line; no volatile tokens, so prompt caching holds.
+        reason = (self._state.last_reason or "").strip()
+        if reason:
+            feedback = f"Last review feedback: {_truncate(reason, 300)}\n\n"
+            prompt = prompt.replace(
+                "Continue working toward", feedback + "Continue working toward", 1
+            )
+        return prompt
 
 
 # ──────────────────────────────────────────────────────────────────────
