@@ -180,6 +180,34 @@ class TestJudgeGoal:
         assert verdict == "done"
         assert reason == "achieved"
 
+    def test_reasoning_only_response_uses_reasoning_fallback(self):
+        """content=None with the verdict in a reasoning field still parses.
+
+        Reasoning models (DeepSeek-R1, Qwen-QwQ, ...) can return content=None
+        with the text in reasoning_content; without the fallback the judge sees
+        an empty body and mis-counts it as a parse failure.
+        """
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        msg = MagicMock(
+            content=None,
+            reasoning=None,
+            reasoning_content='{"done": true, "reason": "done via reasoning"}',
+            reasoning_details=None,
+        )
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=msg)]
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, parse_failed = goals.judge_goal("goal", "agent response")
+        assert verdict == "done"
+        assert reason == "done via reasoning"
+        assert parse_failed is False
+
     def test_judge_says_continue(self):
         from hermes_cli import goals
 
