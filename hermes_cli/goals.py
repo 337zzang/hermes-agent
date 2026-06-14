@@ -1252,19 +1252,37 @@ def judge_goal(
         )
 
     try:
-        # Route through call_llm so auxiliary.goal_judge.* config
-        # (provider/model/base_url, extra_body, reasoning_effort, retries)
-        # all apply — the direct-create path dropped extra_body (#35566).
-        resp = call_llm(
-            task="goal_judge",
-            messages=[
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
-            max_tokens=_goal_judge_max_tokens(),
-            timeout=timeout,
-        )
+        try:
+            # Ask for a structured JSON verdict so weak models are less likely
+            # to wrap it in prose. The P2 parser still handles freeform replies.
+            resp = call_llm(
+                task="goal_judge",
+                messages=[
+                    {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+                max_tokens=_goal_judge_max_tokens(),
+                timeout=timeout,
+                extra_body={"response_format": {"type": "json_object"}},
+            )
+        except Exception as fmt_exc:
+            # Some providers / models reject response_format (400 / unsupported
+            # param). Retry once without it rather than failing the turn.
+            logger.debug(
+                "goal judge: response_format rejected (%s) — retrying without it",
+                fmt_exc,
+            )
+            resp = call_llm(
+                task="goal_judge",
+                messages=[
+                    {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+                max_tokens=_goal_judge_max_tokens(),
+                timeout=timeout,
+            )
     except Exception as exc:
         logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
         return "continue", f"judge error: {type(exc).__name__}", False, None, True
