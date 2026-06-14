@@ -350,6 +350,26 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + "… [truncated]"
 
 
+def parse_goal_budget_flag(arg: str) -> Tuple[Optional[int], str]:
+    """Split a leading ``--budget N`` / ``--turns N`` flag off a /goal argument.
+
+    Returns ``(max_turns, remaining_text)``. Only a leading flag followed by a
+    positive integer is consumed; no flag, a non-int, or a non-positive value
+    leaves the text untouched, so a stray ``--budget`` inside the goal prose is
+    never mistaken for a budget override.
+    """
+    text = (arg or "").strip()
+    parts = text.split(None, 2)
+    if len(parts) >= 2 and parts[0] in ("--budget", "--turns"):
+        try:
+            n = int(parts[1])
+        except ValueError:
+            return None, text
+        if n > 0:
+            return n, (parts[2] if len(parts) > 2 else "")
+    return None, text
+
+
 def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
     """Return the first balanced JSON object embedded in ``text``, or None.
 
@@ -1054,4 +1074,5 @@ __all__ = [
     "clear_goal",
     "judge_goal",
     "run_kanban_goal_loop",
+    "parse_goal_budget_flag",
 ]

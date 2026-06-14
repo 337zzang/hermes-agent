@@ -1603,9 +1603,14 @@ class GatewaySlashCommandsMixin:
                 logger.debug("goal clear: pending continuation cleanup failed: %s", exc)
             return t("gateway.goal_cleared") if had else t("gateway.no_active_goal")
 
-        # Otherwise — treat the remaining text as the new goal.
+        # Otherwise — treat the remaining text as the new goal. A leading
+        # --budget N / --turns N overrides the turn budget for this goal.
+        from hermes_cli.goals import parse_goal_budget_flag
+        budget, goal_text = parse_goal_budget_flag(args)
+        if not goal_text:
+            return t("gateway.goal.invalid", error="empty goal (usage: /goal [--budget N] <text>)")
         try:
-            state = mgr.set(args)
+            state = mgr.set(goal_text, max_turns=budget)
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
 

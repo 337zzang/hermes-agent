@@ -1837,9 +1837,15 @@ class CLICommandsMixin:
                 _cprint(f"  {_DIM}No active goal.{_RST}")
             return
 
-        # Otherwise treat the arg as the goal text.
+        # Otherwise treat the arg as the goal text. A leading --budget N /
+        # --turns N overrides the turn budget just for this goal.
+        from hermes_cli.goals import parse_goal_budget_flag
+        budget, goal_text = parse_goal_budget_flag(arg)
+        if not goal_text:
+            _cprint("  Usage: /goal [--budget N] <text>")
+            return
         try:
-            state = mgr.set(arg)
+            state = mgr.set(goal_text, max_turns=budget)
         except ValueError as exc:
             _cprint(f"  Invalid goal: {exc}")
             return

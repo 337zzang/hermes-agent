@@ -890,3 +890,45 @@ class TestPureHelpers:
                 assert goals._goal_judge_timeout() == goals.DEFAULT_JUDGE_TIMEOUT
         with patch("hermes_cli.config.load_config", return_value={}):
             assert goals._goal_judge_timeout() == goals.DEFAULT_JUDGE_TIMEOUT
+
+
+class TestParseGoalBudgetFlag:
+    def test_no_flag_returns_full_text(self):
+        from hermes_cli.goals import parse_goal_budget_flag
+
+        assert parse_goal_budget_flag("ship the feature") == (None, "ship the feature")
+
+    def test_budget_flag_parsed(self):
+        from hermes_cli.goals import parse_goal_budget_flag
+
+        assert parse_goal_budget_flag("--budget 50 ship it") == (50, "ship it")
+
+    def test_turns_alias_parsed(self):
+        from hermes_cli.goals import parse_goal_budget_flag
+
+        assert parse_goal_budget_flag("--turns 5 do the thing") == (5, "do the thing")
+
+    def test_invalid_budget_value_left_intact(self):
+        """A non-int after the flag is not a budget — leave the text untouched."""
+        from hermes_cli.goals import parse_goal_budget_flag
+
+        assert parse_goal_budget_flag("--budget abc do x") == (None, "--budget abc do x")
+
+    def test_non_positive_budget_left_intact(self):
+        from hermes_cli.goals import parse_goal_budget_flag
+
+        assert parse_goal_budget_flag("--budget 0 do x") == (None, "--budget 0 do x")
+
+    def test_flag_only_without_text(self):
+        from hermes_cli.goals import parse_goal_budget_flag
+
+        assert parse_goal_budget_flag("--budget 50") == (50, "")
+
+    def test_flag_not_at_start_is_ignored(self):
+        """Only a leading flag counts — a stray --budget inside the goal stays."""
+        from hermes_cli.goals import parse_goal_budget_flag
+
+        assert parse_goal_budget_flag("fix the --budget parser") == (
+            None,
+            "fix the --budget parser",
+        )
