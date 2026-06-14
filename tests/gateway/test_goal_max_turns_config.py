@@ -191,3 +191,44 @@ async def test_gateway_subgoal_on_paused_goal_notes_resume(tmp_path, monkeypatch
         assert "resume" in response.lower()  # paused → applies after /goal resume
     finally:
         goals._DB_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_gateway_interrupted_turn_pauses_goal_without_judging(tmp_path, monkeypatch):
+    """An interrupted gateway turn auto-pauses the goal instead of judging the
+    cancelled partial output and re-queuing it (CLI parity)."""
+    from unittest.mock import patch
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("goals:\n  max_turns: 10\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+
+    seed = goals.GoalManager("sid-gateway-goal-config")
+    seed.set("do x")  # active
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _FakeSessionStore()
+    runner.adapters = {}
+    runner._queued_events = {}
+
+    with patch("hermes_cli.goals.judge_goal") as judge_mock:
+        judge_mock.side_effect = AssertionError("judge ran on an interrupted turn")
+        await GatewayRunner._post_turn_goal_continuation(
+            runner,
+            session_entry=_FakeSessionEntry(),
+            source=None,  # skip the status-notice delivery path
+            final_response="partial work before the user cancelled",
+            interrupted=True,
+        )
+
+    try:
+        state = goals.GoalManager("sid-gateway-goal-config").state
+        assert state is not None
+        assert state.status == "paused"
+    finally:
+        goals._DB_CACHE.clear()
