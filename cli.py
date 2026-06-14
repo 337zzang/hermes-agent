@@ -4802,8 +4802,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_last_tts_text = ""  # most recently spoken TTS text (echo guard, #75780)
         self._voice_barge_phase = None  # "generation" or "playback" phase of the last barge trip
 
-        # Status bar visibility (toggled via /statusbar)
-        self._status_bar_visible = True
+        # Status bar visibility (toggled via /statusbar).  Persisted under
+        # display.status_bar so users who hide the footer do not have to repeat
+        # the command in every new session.
+        self._status_bar_visible = bool(CLI_CONFIG.get("display", {}).get("status_bar", True))
         # Battery read-out in the status bar (toggled via /battery, off by
         # default). Persisted to display.battery so it survives restarts.
         self._battery_visible = bool(CLI_CONFIG["display"].get("battery", False))
@@ -10457,7 +10459,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "statusbar":
             self._status_bar_visible = not self._status_bar_visible
             state = "visible" if self._status_bar_visible else "hidden"
-            self._console_print(f"  Status bar {state}")
+            saved = save_config_value("display.status_bar", self._status_bar_visible)
+            suffix = "" if saved else " (not saved)"
+            self._console_print(f"  Status bar {state}{suffix}")
         elif canonical == "diff":
             self._handle_diff_command(cmd_original)
         elif canonical == "battery":
@@ -10919,6 +10923,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
         self._goal_manager = mgr
         return mgr
+
+    def _maybe_auto_start_goal_for_input(self, message) -> bool:
+        """Start a standing goal for agentic ordinary CLI input.
+
+        Returns True only when a new goal was created.  The current message is
+        still processed as the first turn; do not enqueue a separate kickoff or
+        the request would run twice.
+        """
+        try:
+            from hermes_cli.goals import (
+                is_goal_auto_start_enabled,
+                should_auto_start_goal_from_text,
+            )
+        except Exception as exc:
+            logging.debug("goal auto-start unavailable: %s", exc)
+            return False
+        try:
+            if not is_goal_auto_start_enabled(getattr(self, "config", None) or {}):
+                return False
+            if not should_auto_start_goal_from_text(message):
+                return False
+            mgr = self._get_goal_manager()
+            if mgr is None or mgr.has_goal():
+                return False
+            mgr.set(str(message).strip())
+            return True
+        except Exception as exc:
+            logging.debug("goal auto-start failed: %s", exc)
+            return False
 
     def _get_heartbeat_manager(self):
         """Return the HeartbeatManager bound to the current session_id.
@@ -14196,6 +14229,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if isinstance(message, str):
             from run_agent import _sanitize_surrogates
             message = _sanitize_surrogates(message)
+
+        # Optional core goal auto-start.  If enabled and the message looks like
+        # an implementation/debug/verification request, set a standing goal
+        # before this first turn runs.  The post-turn hook drives any needed
+        # continuations, so do not enqueue a duplicate kickoff here.
+        self._maybe_auto_start_goal_for_input(message)
 
         # Keep the exact CLI input dict available until turn-start persistence.
         # Copy the completed agent transcript before appending: otherwise this
