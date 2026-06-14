@@ -587,18 +587,32 @@ def judge_goal(
             current_time=current_time,
         )
 
+    create_kwargs = dict(
+        model=model,
+        messages=[
+            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0,
+        max_tokens=_goal_judge_max_tokens(),
+        timeout=timeout,
+        extra_body=get_auxiliary_extra_body() or None,
+    )
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
-            max_tokens=_goal_judge_max_tokens(),
-            timeout=timeout,
-            extra_body=get_auxiliary_extra_body() or None,
-        )
+        try:
+            # Ask for a structured JSON verdict so weak models are less likely
+            # to wrap it in prose. The P2 parser still handles freeform replies.
+            resp = client.chat.completions.create(
+                **create_kwargs, response_format={"type": "json_object"}
+            )
+        except Exception as fmt_exc:
+            # Some providers / models reject response_format (400 / unsupported
+            # param). Retry once without it rather than failing the turn.
+            logger.debug(
+                "goal judge: response_format rejected (%s) — retrying without it",
+                fmt_exc,
+            )
+            resp = client.chat.completions.create(**create_kwargs)
     except Exception as exc:
         logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
         return "continue", f"judge error: {type(exc).__name__}", False

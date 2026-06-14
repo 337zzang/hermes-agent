@@ -227,6 +227,46 @@ class TestJudgeGoal:
         _, kwargs = fake_client.chat.completions.create.call_args
         assert kwargs["timeout"] == 7.5
 
+    def test_judge_requests_json_object_response_format(self):
+        """judge_goal asks for a structured JSON response when supported."""
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='{"done": false, "reason": "x"}'))]
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            goals.judge_goal("goal", "response")
+        _, kwargs = fake_client.chat.completions.create.call_args
+        assert kwargs.get("response_format") == {"type": "json_object"}
+
+    def test_judge_falls_back_when_response_format_rejected(self):
+        """A provider that rejects response_format → retry once without it
+        (the freeform-JSON parser still handles the reply)."""
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        good = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='{"done": true, "reason": "ok"}'))]
+        )
+        fake_client.chat.completions.create.side_effect = [
+            ValueError("response_format is not supported by this model"),
+            good,
+        ]
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, _ = goals.judge_goal("goal", "response")
+        assert verdict == "done"
+        assert reason == "ok"
+        assert fake_client.chat.completions.create.call_count == 2
+        # The fallback retry must not carry response_format.
+        assert "response_format" not in fake_client.chat.completions.create.call_args_list[1].kwargs
+
     def test_judge_says_continue(self):
         from hermes_cli import goals
 
