@@ -12633,6 +12633,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._pending_messages.pop(session_key, None)
         if release_running_state:
             self._release_running_agent_state(session_key)
+        self._maybe_pause_goal_on_user_interrupt(session_key, source, interrupt_reason)
+
+    def _maybe_pause_goal_on_user_interrupt(
+        self, session_key: str, source: SessionSource, interrupt_reason: str
+    ) -> None:
+        """On a user-initiated stop/reset, pause any standing goal and drop its
+        queued continuations so it isn't auto-continued after the cancelled
+        turn. Timeout / shutdown / restart are NOT user-initiated — leave the
+        goal active so restart auto-resume still works. Best-effort: a goal
+        hiccup must never break stop handling."""
+        if interrupt_reason not in (_INTERRUPT_REASON_STOP, _INTERRUPT_REASON_RESET):
+            return
+        try:
+            adapter = self.adapters.get(source.platform) if source else None
+            if adapter and session_key:
+                self._clear_goal_pending_continuations(session_key, adapter)
+            entry = self.session_store.get_or_create_session(source)
+            sid = getattr(entry, "session_id", None) or ""
+            if not sid:
+                return
+            from hermes_cli.goals import GoalManager
+
+            gmgr = GoalManager(
+                session_id=sid, default_max_turns=self._goal_max_turns_from_config()
+            )
+            if gmgr.is_active():
+                gmgr.pause(reason="user-stopped")
+        except Exception as exc:
+            logger.debug("goal pause-on-interrupt failed: %s", exc)
 
     def _evict_cached_agent(self, session_key: str) -> None:
         """Remove a cached agent for a session (called on /new, /model, etc).
