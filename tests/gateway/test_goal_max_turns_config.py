@@ -2,7 +2,11 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.run import GatewayRunner
+from gateway.run import (
+    GatewayRunner,
+    _INTERRUPT_REASON_STOP,
+    _INTERRUPT_REASON_TIMEOUT,
+)
 from gateway.session import SessionSource
 from hermes_cli import goals
 
@@ -230,5 +234,66 @@ async def test_gateway_interrupted_turn_pauses_goal_without_judging(tmp_path, mo
         state = goals.GoalManager("sid-gateway-goal-config").state
         assert state is not None
         assert state.status == "paused"
+    finally:
+        goals._DB_CACHE.clear()
+
+
+def _stop_runner():
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _FakeSessionStore()
+    runner.adapters = {}  # no adapter → skip continuation-clear, exercise pause only
+    return runner
+
+
+_STOP_SOURCE = SessionSource(
+    platform=Platform.DISCORD, chat_id="chat-goal-config", chat_type="channel", user_id="user-goal-config"
+)
+
+
+def test_user_stop_pauses_active_goal(tmp_path, monkeypatch):
+    """A user-initiated /stop (or reset) pauses a standing goal so it is not
+    auto-continued after the cancelled turn."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("goals:\n  max_turns: 10\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+
+    seed = goals.GoalManager("sid-gateway-goal-config")
+    seed.set("do x")  # active
+
+    runner = _stop_runner()
+    runner._maybe_pause_goal_on_user_interrupt(
+        "agent:main:discord:channel:goal-config", _STOP_SOURCE, _INTERRUPT_REASON_STOP
+    )
+
+    try:
+        assert goals.GoalManager("sid-gateway-goal-config").state.status == "paused"
+    finally:
+        goals._DB_CACHE.clear()
+
+
+def test_timeout_interrupt_leaves_goal_active(tmp_path, monkeypatch):
+    """Non-user interrupts (timeout/shutdown/restart) must NOT pause the goal,
+    so restart auto-resume keeps working."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("goals:\n  max_turns: 10\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+
+    seed = goals.GoalManager("sid-gateway-goal-config")
+    seed.set("do x")  # active
+
+    runner = _stop_runner()
+    runner._maybe_pause_goal_on_user_interrupt(
+        "agent:main:discord:channel:goal-config", _STOP_SOURCE, _INTERRUPT_REASON_TIMEOUT
+    )
+
+    try:
+        assert goals.GoalManager("sid-gateway-goal-config").state.status == "active"
     finally:
         goals._DB_CACHE.clear()
