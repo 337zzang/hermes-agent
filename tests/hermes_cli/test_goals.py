@@ -936,3 +936,86 @@ class TestContractAndBackgroundCompose:
         assert verdict == "wait"
         assert wait_directive and wait_directive.get("pid") == 4242
 
+    def test_contract_goal_can_still_complete_on_evidence(self, hermes_home):
+        from unittest.mock import patch
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalContract
+
+        captured = {}
+        bg = [{"session_id": "ci", "pid": 4242, "status": "running", "command": "ci", "trigger": "exit"}]
+        with patch("agent.auxiliary_client.call_llm",
+                   side_effect=self._capture_call_llm(
+                       captured,
+                       content='{"verdict": "done", "reason": "CI is green, evidence shown"}',
+                   )):
+            verdict, reason, parse_failed, wait_directive, _tf = goals.judge_goal(
+                "ship the PR",
+                "CI finished: 30 passed, 0 failed. Done.",
+                contract=GoalContract(verification="PR CI goes green"),
+                background_processes=bg,
+            )
+        assert verdict == "done"
+        assert wait_directive is None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Pure config/string helpers — fallback guards (incl. the documented
+# reasoning-model truncation regression that max_tokens defends against).
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestPureHelpers:
+    def test_truncate_under_limit_unchanged(self):
+        from hermes_cli.goals import _truncate
+
+        assert _truncate("short", 100) == "short"
+        assert _truncate("", 100) == ""
+
+    def test_truncate_over_limit_appends_marker(self):
+        from hermes_cli.goals import _truncate
+
+        out = _truncate("x" * 50, 10)
+        assert out.startswith("x" * 10)
+        assert out.endswith("… [truncated]")
+
+    def test_goal_judge_max_tokens_from_config(self):
+        from hermes_cli import goals
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"goal_judge": {"max_tokens": 1234}}},
+        ):
+            assert goals._goal_judge_max_tokens() == 1234
+
+    def test_goal_judge_max_tokens_falls_back_on_bad_value(self):
+        from hermes_cli import goals
+
+        for bad in (0, -5, "nope", None):
+            with patch(
+                "hermes_cli.config.load_config",
+                return_value={"auxiliary": {"goal_judge": {"max_tokens": bad}}},
+            ):
+                assert goals._goal_judge_max_tokens() == goals.DEFAULT_JUDGE_MAX_TOKENS
+        with patch("hermes_cli.config.load_config", return_value={}):
+            assert goals._goal_judge_max_tokens() == goals.DEFAULT_JUDGE_MAX_TOKENS
+
+    def test_goal_judge_timeout_from_config(self):
+        from hermes_cli import goals
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"goal_judge": {"timeout": 12.5}}},
+        ):
+            assert goals._goal_judge_timeout() == 12.5
+
+    def test_goal_judge_timeout_falls_back_on_bad_value(self):
+        from hermes_cli import goals
+
+        for bad in (0, -1, "nope", None):
+            with patch(
+                "hermes_cli.config.load_config",
+                return_value={"auxiliary": {"goal_judge": {"timeout": bad}}},
+            ):
+                assert goals._goal_judge_timeout() == goals.DEFAULT_JUDGE_TIMEOUT
+        with patch("hermes_cli.config.load_config", return_value={}):
+            assert goals._goal_judge_timeout() == goals.DEFAULT_JUDGE_TIMEOUT
