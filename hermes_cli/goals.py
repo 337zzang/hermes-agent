@@ -923,8 +923,11 @@ def run_kanban_goal_loop(
     (reason: str -> None).
 
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
-    outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    outcome is one of ``"completed_by_worker"``, ``"blocked_budget"`` (turn
+    budget exhausted), ``"blocked_unfinalized"`` (judged done but the worker
+    never called kanban_complete after a nudge), ``"blocked_judge_unparseable"``
+    (judge output unparseable N turns in a row), ``"blocked_by_worker"``, or
+    ``"stopped"``.
     """
 
     def _log(msg: str) -> None:
@@ -942,6 +945,7 @@ def run_kanban_goal_loop(
     # The first turn already consumed one unit of budget.
     turns_used = 1
     nudged_to_finalize = False
+    consecutive_parse_failures = 0
 
     while True:
         # Did the worker terminate the task itself this turn?
@@ -963,8 +967,37 @@ def run_kanban_goal_loop(
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
 
         # Still open — judge whether the latest response satisfies the card.
-        verdict, reason, _parse_failed = judge_goal(goal_text, last_response)
+        verdict, reason, parse_failed = judge_goal(goal_text, last_response)
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+
+        # Backstop: a judge that keeps returning unparseable output is broken —
+        # block for review instead of burning the whole budget on fail-open
+        # continues (mirrors the main loop's consecutive-parse-failure pause).
+        # parse_failed is True only for usable-output failures, not transient
+        # API errors, so a flaky network won't trip this.
+        if parse_failed:
+            consecutive_parse_failures += 1
+        else:
+            consecutive_parse_failures = 0
+        if consecutive_parse_failures >= DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES:
+            _log(
+                f"kanban goal loop: task {task_id} judge unparseable "
+                f"{consecutive_parse_failures} turns in a row; blocking"
+            )
+            try:
+                block_fn(
+                    f"Goal-mode judge returned unparseable output "
+                    f"{consecutive_parse_failures} turns in a row — the judge model "
+                    f"likely can't honor the JSON contract. Set a stricter "
+                    f"auxiliary.goal_judge model."
+                )
+            except Exception as exc:
+                _log(f"kanban goal loop: block_fn failed ({exc})")
+            return {
+                "outcome": "blocked_judge_unparseable",
+                "turns_used": turns_used,
+                "reason": f"judge unparseable {consecutive_parse_failures} turns in a row",
+            }
 
         if verdict == "done":
             if nudged_to_finalize:
@@ -978,7 +1011,7 @@ def run_kanban_goal_loop(
                     )
                 except Exception as exc:
                     _log(f"kanban goal loop: block_fn failed ({exc})")
-                return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "judged done, never finalized"}
+                return {"outcome": "blocked_unfinalized", "turns_used": turns_used, "reason": "judged done, never finalized"}
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
         else:
