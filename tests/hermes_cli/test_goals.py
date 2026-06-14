@@ -48,6 +48,65 @@ class TestParseJudgeResponse:
 
 
 
+    def test_json_in_markdown_fence(self):
+        from hermes_cli.goals import _parse_judge_response
+
+        raw = '```json\n{"done": true, "reason": "done"}\n```'
+        verdict, reason, _pf, _w = _parse_judge_response(raw)
+        assert verdict == "done"
+        assert "done" in reason
+
+    def test_json_embedded_in_prose(self):
+        """Some models prefix reasoning before emitting JSON — we extract it."""
+        from hermes_cli.goals import _parse_judge_response
+
+        raw = 'Looking at this... the agent says X. Verdict: {"done": false, "reason": "partial"}'
+        verdict, reason, _pf, _w = _parse_judge_response(raw)
+        assert verdict == "continue"
+        assert reason == "partial"
+
+    def test_json_with_braces_inside_reason_string(self):
+        """Braces inside the reason string must not truncate extraction (regression).
+
+        The old non-greedy ``\\{.*?\\}`` regex stopped at the first ``}`` — here
+        the ``}`` after ``{x}`` — yielding invalid JSON and a false parse failure.
+        """
+        from hermes_cli.goals import _parse_judge_response
+
+        raw = 'Reasoning first. Verdict: {"done": false, "reason": "need {x} fixed first"}'
+        done, reason, parse_failed = _parse_judge_response(raw)
+        assert done is False
+        assert reason == "need {x} fixed first"
+        assert parse_failed is False
+
+    def test_json_with_nested_object_in_prose(self):
+        """A nested object after prose must be extracted whole, not truncated."""
+        from hermes_cli.goals import _parse_judge_response
+
+        raw = 'Thinking... Verdict: {"done": true, "reason": "ok", "meta": {"score": 1}}'
+        done, reason, parse_failed = _parse_judge_response(raw)
+        assert done is True
+        assert reason == "ok"
+        assert parse_failed is False
+
+    def test_string_done_values(self):
+        from hermes_cli.goals import _parse_judge_response
+
+        for s in ("true", "yes", "done", "1"):
+            verdict, _, _, _ = _parse_judge_response(f'{{"done": "{s}", "reason": "r"}}')
+            assert verdict == "done"
+        for s in ("false", "no", "not yet"):
+            verdict, _, _, _ = _parse_judge_response(f'{{"done": "{s}", "reason": "r"}}')
+            assert verdict == "continue"
+
+    def test_new_verdict_shape(self):
+        """The explicit {"verdict": ...} shape is honored."""
+        from hermes_cli.goals import _parse_judge_response
+
+        v, _, _, _ = _parse_judge_response('{"verdict": "done", "reason": "r"}')
+        assert v == "done"
+        v, _, _, _ = _parse_judge_response('{"verdict": "continue", "reason": "r"}')
+        assert v == "continue"
 
     def test_wait_verdict_with_pid(self):
         from hermes_cli.goals import _parse_judge_response

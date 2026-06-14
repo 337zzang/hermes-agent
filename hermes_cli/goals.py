@@ -894,6 +894,29 @@ def _session_waiting(session_id: str) -> bool:
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
 
+def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Return the first balanced JSON object embedded in ``text``, or None.
+
+    Scans with ``json.JSONDecoder.raw_decode`` from each ``{`` so nested objects
+    and braces inside string values parse correctly. The old non-greedy
+    ``\\{.*?\\}`` regex stopped at the first ``}`` and mis-parsed those cases as
+    failures, which inflated the consecutive-parse-failure auto-pause counter.
+    """
+    decoder = json.JSONDecoder()
+    idx = 0
+    while True:
+        start = text.find("{", idx)
+        if start == -1:
+            return None
+        try:
+            obj, _end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            idx = start + 1
+            continue
+        if isinstance(obj, dict):
+            return obj
+        idx = start + 1
+
 
 def _goal_judge_max_tokens() -> int:
     """Resolve auxiliary.goal_judge.max_tokens, falling back to the default.
@@ -954,13 +977,10 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     try:
         data = json.loads(text)
     except Exception:
-        # Second try: pull the first JSON object out.
-        match = _JSON_OBJECT_RE.search(text)
-        if match:
-            try:
-                data = json.loads(match.group(0))
-            except Exception:
-                data = None
+        # Second try: pull the first balanced JSON object out. Handles nested
+        # objects and braces inside string values (e.g. a reason like
+        # "need {x} fixed") that the old non-greedy regex truncated.
+        data = _extract_first_json_object(text)
 
     if not isinstance(data, dict):
         return "continue", f"judge reply was not JSON: {_truncate(raw, 200)!r}", True, None
