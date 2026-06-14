@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -351,7 +350,28 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + "… [truncated]"
 
 
-_JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
+def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Return the first balanced JSON object embedded in ``text``, or None.
+
+    Scans with ``json.JSONDecoder.raw_decode`` from each ``{`` so nested objects
+    and braces inside string values parse correctly. The old non-greedy
+    ``\\{.*?\\}`` regex stopped at the first ``}`` and mis-parsed those cases as
+    failures, which inflated the consecutive-parse-failure auto-pause counter.
+    """
+    decoder = json.JSONDecoder()
+    idx = 0
+    while True:
+        start = text.find("{", idx)
+        if start == -1:
+            return None
+        try:
+            obj, _end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            idx = start + 1
+            continue
+        if isinstance(obj, dict):
+            return obj
+        idx = start + 1
 
 
 def _goal_judge_max_tokens() -> int:
@@ -405,13 +425,10 @@ def _parse_judge_response(raw: str) -> Tuple[bool, str, bool]:
     try:
         data = json.loads(text)
     except Exception:
-        # Second try: pull the first JSON object out.
-        match = _JSON_OBJECT_RE.search(text)
-        if match:
-            try:
-                data = json.loads(match.group(0))
-            except Exception:
-                data = None
+        # Second try: pull the first balanced JSON object out. Handles nested
+        # objects and braces inside string values (e.g. a reason like
+        # "need {x} fixed") that the old non-greedy regex truncated.
+        data = _extract_first_json_object(text)
 
     if not isinstance(data, dict):
         return False, f"judge reply was not JSON: {_truncate(raw, 200)!r}", True
