@@ -1091,3 +1091,42 @@ class TestParseResumeFlags:
         from hermes_cli.goals import parse_resume_flags
 
         assert parse_resume_flags("--whatever") == (True, None)
+
+
+class TestGoalStatePersistence:
+    """Round-trip + fail-safe guards for the /resume persistence backbone."""
+
+    def test_goalstate_full_roundtrip(self):
+        from hermes_cli.goals import GoalState
+
+        st = GoalState(
+            goal="ship it",
+            status="paused",
+            turns_used=4,
+            max_turns=12,
+            created_at=111.0,
+            last_turn_at=222.0,
+            last_verdict="continue",
+            last_reason="needs tests",
+            paused_reason="turn budget exhausted (12/12)",
+            consecutive_parse_failures=2,
+            subgoals=["a", "b"],
+        )
+        assert GoalState.from_json(st.to_json()) == st
+
+    def test_load_goal_returns_none_on_corrupt_row(self, hermes_home):
+        from hermes_cli import goals
+
+        db = goals._get_session_db()
+        assert db is not None
+        db.set_meta(goals._meta_key("corrupt-sid"), "{not valid json")
+        assert goals.load_goal("corrupt-sid") is None
+
+    def test_module_clear_goal_marks_cleared(self, hermes_home):
+        from hermes_cli import goals
+
+        goals.save_goal("clr-sid", goals.GoalState(goal="do x"))
+        goals.clear_goal("clr-sid")
+        loaded = goals.load_goal("clr-sid")
+        assert loaded is not None
+        assert loaded.status == "cleared"
