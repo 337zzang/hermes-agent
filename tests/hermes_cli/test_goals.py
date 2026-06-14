@@ -208,6 +208,25 @@ class TestJudgeGoal:
         assert reason == "done via reasoning"
         assert parse_failed is False
 
+    def test_judge_timeout_resolved_from_config(self):
+        """auxiliary.goal_judge.timeout flows through to the judge API call."""
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='{"done": false, "reason": "x"}'))]
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ), patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"goal_judge": {"timeout": 7.5}}},
+        ):
+            goals.judge_goal("goal", "response")
+        _, kwargs = fake_client.chat.completions.create.call_args
+        assert kwargs["timeout"] == 7.5
+
     def test_judge_says_continue(self):
         from hermes_cli import goals
 
