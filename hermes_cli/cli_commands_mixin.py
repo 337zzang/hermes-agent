@@ -2732,8 +2732,14 @@ class CLICommandsMixin:
 
         headline, contract = parse_contract(arg)
         goal_text = headline or arg
+        # A leading --budget N / --turns N overrides the turn budget just for this goal.
+        from hermes_cli.goals import parse_goal_budget_flag
+        budget, goal_text = parse_goal_budget_flag(goal_text)
+        if not goal_text:
+            _cprint("  Usage: /goal [--budget N] <text>")
+            return
         try:
-            state = mgr.set(goal_text, contract=contract if not contract.is_empty() else None)
+            state = mgr.set(goal_text, max_turns=budget, contract=contract if not contract.is_empty() else None)
         except ValueError as exc:
             _cprint(f"  Invalid goal: {exc}")
             return
