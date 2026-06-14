@@ -101,3 +101,51 @@ async def test_gateway_goal_budget_flag_overrides_max_turns(tmp_path, monkeypatc
         assert state.goal == "ship the benchmark"
     finally:
         goals._DB_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_gateway_goal_resume_extend_adds_budget_keeps_progress(tmp_path, monkeypatch):
+    """`/goal resume extend N` adds N turns and keeps progress (no reset)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("goals:\n  max_turns: 10\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+
+    # Seed a paused goal that already spent 7 of 10 turns.
+    seed = goals.GoalManager("sid-gateway-goal-config")
+    seed.set("do x", max_turns=10)
+    seed.state.turns_used = 7
+    goals.save_goal("sid-gateway-goal-config", seed.state)
+    seed.pause()
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _FakeSessionStore()
+    runner.adapters = {}
+    runner._queued_events = {}
+
+    event = MessageEvent(
+        text="/goal resume extend 5",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chat-goal-config",
+            chat_type="channel",
+            user_id="user-goal-config",
+        ),
+        message_id="msg-goal-resume",
+    )
+
+    await GatewayRunner._handle_goal_command(runner, event)
+
+    try:
+        state = goals.GoalManager("sid-gateway-goal-config").state
+        assert state is not None
+        assert state.status == "active"
+        assert state.max_turns == 15  # 10 + 5
+        assert state.turns_used == 7  # progress kept (no reset)
+    finally:
+        goals._DB_CACHE.clear()
