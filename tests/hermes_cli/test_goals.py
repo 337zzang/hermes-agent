@@ -540,6 +540,21 @@ class TestGoalManager:
         assert prompt is not None
         assert "port goal command to hermes" in prompt
         assert prompt.strip()  # non-empty
+        # No judge feedback yet (goal just set) → no feedback line.
+        assert "Last review feedback" not in prompt
+
+    def test_continuation_prompt_includes_last_judge_reason(self, hermes_home):
+        """The continuation carries the judge's last feedback so the next turn
+        knows what was missing (mirrors the kanban continuation)."""
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="cont-reason")
+        mgr.set("ship the feature")
+        mgr.state.last_reason = "tests are still failing"
+        prompt = mgr.next_continuation_prompt()
+        assert prompt is not None
+        assert "Last review feedback: tests are still failing" in prompt
+        assert "ship the feature" in prompt
 
 
 # ──────────────────────────────────────────────────────────────────────
