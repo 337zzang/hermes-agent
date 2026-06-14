@@ -7584,6 +7584,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            self._maybe_auto_start_goal_for_event(event)
+        except Exception as _goal_auto_exc:
+            logger.debug("goal auto-start hook failed: %s", _goal_auto_exc)
+
+        try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
@@ -9491,6 +9496,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         max_turns = self._goal_max_turns_from_config()
         return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
 
+    def _maybe_auto_start_goal_for_event(self, event: "MessageEvent") -> bool:
+        """Start a standing goal for agentic ordinary gateway input.
+
+        Returns True only when a new goal was created.  The inbound event remains
+        the first user turn; goal continuations are scheduled after that turn by
+        _post_turn_goal_continuation().
+        """
+        try:
+            from hermes_cli.goals import (
+                is_goal_auto_start_enabled,
+                should_auto_start_goal_from_text,
+            )
+        except Exception as exc:
+            logger.debug("goal auto-start unavailable: %s", exc)
+            return False
+        try:
+            goals_config: Dict[str, Any] = {}
+            cfg_obj = getattr(self, "config", None)
+            if isinstance(cfg_obj, dict):
+                goals_config = dict(cfg_obj)
+            else:
+                raw_goals = getattr(cfg_obj, "goals", None)
+                if raw_goals is not None:
+                    goals_config = {"goals": raw_goals}
+                else:
+                    try:
+                        from hermes_cli.config import load_config
+                        goals_config = load_config() or {}
+                    except Exception:
+                        goals_config = {}
+            if not is_goal_auto_start_enabled(goals_config):
+                return False
+            if getattr(event, "internal", False):
+                return False
+            if getattr(event, "message_type", None) != MessageType.TEXT:
+                return False
+            if not should_auto_start_goal_from_text(getattr(event, "text", None)):
+                return False
+            mgr, _session_entry = self._get_goal_manager_for_event(event)
+            if mgr is None or mgr.has_goal():
+                return False
+            mgr.set(str(event.text).strip())
+            return True
+        except Exception as exc:
+            logger.debug("goal auto-start failed: %s", exc)
+            return False
 
 
     async def _send_goal_status_notice(self, source: Any, message: str) -> None:

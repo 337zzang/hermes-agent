@@ -67,6 +67,23 @@ _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
 # `judge reply was not JSON`.
 DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 
+# Conservative goal auto-start classifier.  Auto-start is opt-in via
+# goals.auto_start.enabled; when enabled, these helpers decide whether an
+# ordinary inbound user message should create a standing goal before the turn
+# runs.  Keep this module side-effect-free so CLI and Gateway can share the
+# same policy and tests can exercise it without spinning up an agent.
+_AUTO_START_AGENTIC_PATTERNS = re.compile(
+    r"(implement|debug|fix|repair|refactor|test|verify|investigate|trace|"
+    r"review|build|ship|add|create|update|modify|change|troubleshoot|"
+    r"구현|디버그|수정|고쳐|고쳐줘|잡아줘|테스트|검증|확인|추적|"
+    r"리팩토|리뷰|만들|추가|변경|적용|실행|개선)",
+    re.IGNORECASE,
+)
+_AUTO_START_SHORT_ACKS = {
+    "y", "yes", "ㅇ", "응", "네", "예", "ok", "okay", "확인", "승인",
+    "approve", "approved", "deny", "denied", "no", "아니", "아니요",
+}
+
 
 CONTINUATION_PROMPT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
@@ -132,6 +149,48 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "is NOT done — return CONTINUE.\n\n"
     "Is the goal AND every additional criterion satisfied?"
 )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Auto-start policy helpers
+# ──────────────────────────────────────────────────────────────────────
+
+
+def is_goal_auto_start_enabled(config: Optional[Dict[str, Any]]) -> bool:
+    """Return whether ordinary inbound messages may start standing goals.
+
+    The feature is intentionally opt-in. Missing or malformed config behaves
+    like disabled so upgrades do not unexpectedly turn every chat into a goal
+    loop.
+    """
+    try:
+        goals_cfg = (config or {}).get("goals") or {}
+        auto_cfg = goals_cfg.get("auto_start") or {}
+        if isinstance(auto_cfg, bool):
+            return bool(auto_cfg)
+        return bool(auto_cfg.get("enabled", False))
+    except Exception:
+        return False
+
+
+def should_auto_start_goal_from_text(text: Any) -> bool:
+    """Conservative, side-effect-free classifier for goal auto-start."""
+    if not isinstance(text, str):
+        return False
+    raw = text.strip()
+    if not raw:
+        return False
+    if raw.startswith("/"):
+        return False
+    if raw.startswith("[Continuing toward your standing goal]"):
+        return False
+    lowered = raw.lower().strip()
+    if lowered in _AUTO_START_SHORT_ACKS:
+        return False
+    has_agentic_verb = bool(_AUTO_START_AGENTIC_PATTERNS.search(raw))
+    if not has_agentic_verb and len(raw) < 160 and raw.endswith(("?", "？")):
+        return False
+    return has_agentic_verb
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -1803,6 +1803,12 @@ DEFAULT_CONFIG = {
         # negatives (goal actually done but judge says continue) and
         # unbounded model spend on fuzzy / unachievable goals.
         "max_turns": 20,
+        # Opt-in: when true, ordinary agentic implementation/debug/verify
+        # messages create a standing goal automatically.  Slash commands,
+        # short approvals, simple questions, synthetic continuations, and
+        # sessions that already have a goal are excluded by shared CLI/Gateway
+        # classifiers in hermes_cli.goals.
+        "auto_start": {"enabled": False},
     },
 
     # Skills — external skill directories for sharing skills across tools/agents.
