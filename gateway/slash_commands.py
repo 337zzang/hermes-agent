@@ -1684,7 +1684,10 @@ class GatewaySlashCommandsMixin:
         except (ValueError, RuntimeError) as exc:
             return f"/subgoal: {exc}"
         idx = len(mgr.state.subgoals) if mgr.state else 0
-        return f"✓ Added subgoal {idx}: {text}"
+        msg = f"✓ Added subgoal {idx}: {text}"
+        if not mgr.is_active():
+            msg += "\nGoal is paused — this criterion applies after /goal resume."
+        return msg
 
     async def _handle_undo_command(self, event: MessageEvent) -> str:
         """Handle /undo [N] — back up N user turns (default 1), soft-deleting

@@ -1942,6 +1942,11 @@ class CLICommandsMixin:
             return
         idx = len(mgr.state.subgoals) if mgr.state else 0
         _cprint(f"  ✓ Added subgoal {idx}: {text}")
+        if not mgr.is_active():
+            _cprint(
+                f"  {_DIM}Goal is paused — this criterion applies after "
+                f"/goal resume.{_RST}"
+            )
 
     def _handle_skin_command(self, cmd: str):
         """Handle /skin [name] — show or change the display skin."""
