@@ -128,8 +128,102 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
+def test_loop_blocks_on_budget_exhaustion(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"] * 10)
+    blocked = {}
+
+    def _block(reason):
+        blocked["reason"] = reason
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t3",
+        goal_text="endless task",
+        run_turn=lambda p: "still going",
+        task_status_fn=lambda: "running",
+        block_fn=_block,
+        max_turns=3,
+        first_response="turn1",
+    )
+    assert res["outcome"] == "blocked_budget"
+    assert res["turns_used"] == 3
+    assert "turn budget" in blocked["reason"].lower()
 
 
+def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
+    # Judge says done, but worker never terminated → one finalize nudge,
+    # then worker completes.
+    _patch_judge(monkeypatch, ["done", "done"])
+    statuses = iter(["running", "done"])
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t4",
+        goal_text="task",
+        run_turn=lambda p: turns.append(p) or "ok",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=10,
+        first_response="looks done",
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert len(turns) == 1
+    assert "still open" in turns[0]
+
+
+def test_loop_blocks_when_judge_done_but_never_finalizes(monkeypatch):
+    # Judge keeps saying done, worker never calls kanban_complete → block
+    # after the single finalize nudge.
+    _patch_judge(monkeypatch, ["done", "done"])
+    blocked = {}
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t5",
+        goal_text="task",
+        run_turn=lambda p: "still not finalizing",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked.update(reason=r),
+        max_turns=10,
+        first_response="looks done",
+    )
+    assert res["outcome"] == "blocked_unfinalized"
+    assert "finalize" in blocked["reason"].lower()
+
+
+def test_loop_blocks_on_repeated_judge_parse_failures(monkeypatch):
+    # A weak judge model that returns unparseable output every turn must trip
+    # the consecutive-parse-failure backstop and block for review, rather than
+    # silently burning the whole budget on fail-open continues.
+    def _fake_judge(goal, response, subgoals=None):
+        return "continue", "scripted:parse-fail", True  # parse_failed=True
+
+    monkeypatch.setattr(goals, "judge_goal", _fake_judge)
+    blocked = {}
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t6",
+        goal_text="task",
+        run_turn=lambda p: "more output",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked.update(reason=r),
+        max_turns=20,  # high, so the backstop (not the budget) is what trips
+        first_response="output",
+    )
+    assert res["outcome"] == "blocked_judge_unparseable"
+    assert res["turns_used"] < 20  # blocked before budget exhaustion
+    assert "unparseable" in blocked["reason"].lower()
+
+
+def test_loop_stops_if_task_reclaimed(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"])
+    res = goals.run_kanban_goal_loop(
+        task_id="t6",
+        goal_text="task",
+        run_turn=lambda p: pytest.fail("should not run a turn"),
+        task_status_fn=lambda: "archived",
+        block_fn=lambda r: pytest.fail("should not block"),
+        first_response="x",
+    )
+    assert res["outcome"] == "stopped"
 
 
 # ---------------------------------------------------------------------------
