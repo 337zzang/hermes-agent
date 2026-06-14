@@ -1135,7 +1135,7 @@ def judge_goal(
         return "continue", "empty response (nothing to evaluate)", False, None, False
 
     try:
-        from agent.auxiliary_client import call_llm
+        from agent.auxiliary_client import call_llm, extract_content_or_reasoning
     except Exception as exc:
         logger.debug("goal judge: auxiliary client import failed: %s", exc)
         return "continue", "auxiliary client unavailable", False, None, False
@@ -1202,6 +1202,11 @@ def judge_goal(
 
     try:
         raw = resp.choices[0].message.content or ""
+        if not raw:
+            # Reasoning models (DeepSeek-R1, Qwen-QwQ, ...) can return
+            # content=None with the verdict in a structured reasoning field;
+            # reuse the agent loop's extractor instead of treating it as empty.
+            raw = extract_content_or_reasoning(resp) or ""
     except Exception:
         raw = ""
 
