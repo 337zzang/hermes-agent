@@ -827,3 +827,66 @@ class TestStatusLineSubgoalCount:
         mgr.add_subgoal("b")
         line = mgr.status_line()
         assert "2 subgoals" in line
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Pure config/string helpers — fallback guards (incl. the documented
+# reasoning-model truncation regression that max_tokens defends against).
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestPureHelpers:
+    def test_truncate_under_limit_unchanged(self):
+        from hermes_cli.goals import _truncate
+
+        assert _truncate("short", 100) == "short"
+        assert _truncate("", 100) == ""
+
+    def test_truncate_over_limit_appends_marker(self):
+        from hermes_cli.goals import _truncate
+
+        out = _truncate("x" * 50, 10)
+        assert out.startswith("x" * 10)
+        assert out.endswith("… [truncated]")
+
+    def test_goal_judge_max_tokens_from_config(self):
+        from hermes_cli import goals
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"goal_judge": {"max_tokens": 1234}}},
+        ):
+            assert goals._goal_judge_max_tokens() == 1234
+
+    def test_goal_judge_max_tokens_falls_back_on_bad_value(self):
+        from hermes_cli import goals
+
+        for bad in (0, -5, "nope", None):
+            with patch(
+                "hermes_cli.config.load_config",
+                return_value={"auxiliary": {"goal_judge": {"max_tokens": bad}}},
+            ):
+                assert goals._goal_judge_max_tokens() == goals.DEFAULT_JUDGE_MAX_TOKENS
+        with patch("hermes_cli.config.load_config", return_value={}):
+            assert goals._goal_judge_max_tokens() == goals.DEFAULT_JUDGE_MAX_TOKENS
+
+    def test_goal_judge_timeout_from_config(self):
+        from hermes_cli import goals
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"goal_judge": {"timeout": 12.5}}},
+        ):
+            assert goals._goal_judge_timeout() == 12.5
+
+    def test_goal_judge_timeout_falls_back_on_bad_value(self):
+        from hermes_cli import goals
+
+        for bad in (0, -1, "nope", None):
+            with patch(
+                "hermes_cli.config.load_config",
+                return_value={"auxiliary": {"goal_judge": {"timeout": bad}}},
+            ):
+                assert goals._goal_judge_timeout() == goals.DEFAULT_JUDGE_TIMEOUT
+        with patch("hermes_cli.config.load_config", return_value={}):
+            assert goals._goal_judge_timeout() == goals.DEFAULT_JUDGE_TIMEOUT
