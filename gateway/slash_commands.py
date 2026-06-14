@@ -1585,8 +1585,10 @@ class GatewaySlashCommandsMixin:
                 logger.debug("goal pause: pending continuation cleanup failed: %s", exc)
             return t("gateway.goal.paused", goal=state.goal)
 
-        if lower == "resume":
-            state = mgr.resume()
+        if lower == "resume" or lower.startswith("resume "):
+            from hermes_cli.goals import parse_resume_flags
+            reset_budget, extend = parse_resume_flags(args[len("resume"):])
+            state = mgr.resume(reset_budget=reset_budget, extend_turns=extend)
             if state is None:
                 return t("gateway.goal.no_resume")
             return t("gateway.goal.resumed", goal=state.goal)
@@ -1603,9 +1605,14 @@ class GatewaySlashCommandsMixin:
                 logger.debug("goal clear: pending continuation cleanup failed: %s", exc)
             return t("gateway.goal_cleared") if had else t("gateway.no_active_goal")
 
-        # Otherwise — treat the remaining text as the new goal.
+        # Otherwise — treat the remaining text as the new goal. A leading
+        # --budget N / --turns N overrides the turn budget for this goal.
+        from hermes_cli.goals import parse_goal_budget_flag
+        budget, goal_text = parse_goal_budget_flag(args)
+        if not goal_text:
+            return t("gateway.goal.invalid", error="empty goal (usage: /goal [--budget N] <text>)")
         try:
-            state = mgr.set(args)
+            state = mgr.set(goal_text, max_turns=budget)
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
 
@@ -1677,7 +1684,10 @@ class GatewaySlashCommandsMixin:
         except (ValueError, RuntimeError) as exc:
             return f"/subgoal: {exc}"
         idx = len(mgr.state.subgoals) if mgr.state else 0
-        return f"✓ Added subgoal {idx}: {text}"
+        msg = f"✓ Added subgoal {idx}: {text}"
+        if not mgr.is_active():
+            msg += "\nGoal is paused — this criterion applies after /goal resume."
+        return msg
 
     async def _handle_undo_command(self, event: MessageEvent) -> str:
         """Handle /undo [N] — back up N user turns (default 1), soft-deleting

@@ -1816,12 +1816,16 @@ class CLICommandsMixin:
                 _cprint(f"  ⏸ Goal paused: {state.goal}")
             return
 
-        if lower == "resume":
-            state = mgr.resume()
+        if lower == "resume" or lower.startswith("resume "):
+            from hermes_cli.goals import parse_resume_flags
+            reset_budget, extend = parse_resume_flags(arg[len("resume"):])
+            state = mgr.resume(reset_budget=reset_budget, extend_turns=extend)
             if state is None:
                 _cprint(f"  {_DIM}No goal to resume.{_RST}")
             else:
-                _cprint(f"  ▶ Goal resumed: {state.goal}")
+                _cprint(
+                    f"  ▶ Goal resumed ({state.turns_used}/{state.max_turns} turns): {state.goal}"
+                )
                 _cprint(
                     f"  {_DIM}Send any message (or press Enter on an empty prompt "
                     f"is a no-op; type 'continue' to kick it off).{_RST}"
@@ -1837,9 +1841,15 @@ class CLICommandsMixin:
                 _cprint(f"  {_DIM}No active goal.{_RST}")
             return
 
-        # Otherwise treat the arg as the goal text.
+        # Otherwise treat the arg as the goal text. A leading --budget N /
+        # --turns N overrides the turn budget just for this goal.
+        from hermes_cli.goals import parse_goal_budget_flag
+        budget, goal_text = parse_goal_budget_flag(arg)
+        if not goal_text:
+            _cprint("  Usage: /goal [--budget N] <text>")
+            return
         try:
-            state = mgr.set(arg)
+            state = mgr.set(goal_text, max_turns=budget)
         except ValueError as exc:
             _cprint(f"  Invalid goal: {exc}")
             return
@@ -1932,6 +1942,11 @@ class CLICommandsMixin:
             return
         idx = len(mgr.state.subgoals) if mgr.state else 0
         _cprint(f"  ✓ Added subgoal {idx}: {text}")
+        if not mgr.is_active():
+            _cprint(
+                f"  {_DIM}Goal is paused — this criterion applies after "
+                f"/goal resume.{_RST}"
+            )
 
     def _handle_skin_command(self, cmd: str):
         """Handle /skin [name] — show or change the display skin."""

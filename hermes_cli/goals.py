@@ -351,7 +351,71 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + "… [truncated]"
 
 
-_JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
+def parse_goal_budget_flag(arg: str) -> Tuple[Optional[int], str]:
+    """Split a leading ``--budget N`` / ``--turns N`` flag off a /goal argument.
+
+    Returns ``(max_turns, remaining_text)``. Only a leading flag followed by a
+    positive integer is consumed; no flag, a non-int, or a non-positive value
+    leaves the text untouched, so a stray ``--budget`` inside the goal prose is
+    never mistaken for a budget override.
+    """
+    text = (arg or "").strip()
+    parts = text.split(None, 2)
+    if len(parts) >= 2 and parts[0] in ("--budget", "--turns"):
+        try:
+            n = int(parts[1])
+        except ValueError:
+            return None, text
+        if n > 0:
+            return n, (parts[2] if len(parts) > 2 else "")
+    return None, text
+
+
+def parse_resume_flags(arg: str) -> Tuple[bool, Optional[int]]:
+    """Parse ``/goal resume`` modifiers → ``(reset_budget, extend_turns)``.
+
+    - ``""``            → ``(True, None)``   reset the turn budget (default)
+    - ``--keep-budget`` → ``(False, None)``  resume without resetting progress
+    - ``extend N``      → ``(False, N)``     add N turns, keep progress
+    Anything unrecognized falls back to the default reset behavior.
+    """
+    tokens = (arg or "").strip().split()
+    if not tokens:
+        return True, None
+    if tokens[0] == "--keep-budget":
+        return False, None
+    if tokens[0] == "extend" and len(tokens) > 1:
+        try:
+            n = int(tokens[1])
+        except ValueError:
+            return True, None
+        if n > 0:
+            return False, n
+    return True, None
+
+
+def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Return the first balanced JSON object embedded in ``text``, or None.
+
+    Scans with ``json.JSONDecoder.raw_decode`` from each ``{`` so nested objects
+    and braces inside string values parse correctly. The old non-greedy
+    ``\\{.*?\\}`` regex stopped at the first ``}`` and mis-parsed those cases as
+    failures, which inflated the consecutive-parse-failure auto-pause counter.
+    """
+    decoder = json.JSONDecoder()
+    idx = 0
+    while True:
+        start = text.find("{", idx)
+        if start == -1:
+            return None
+        try:
+            obj, _end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            idx = start + 1
+            continue
+        if isinstance(obj, dict):
+            return obj
+        idx = start + 1
 
 
 def _goal_judge_max_tokens() -> int:
@@ -376,6 +440,30 @@ def _goal_judge_max_tokens() -> int:
     except Exception:
         pass
     return DEFAULT_JUDGE_MAX_TOKENS
+
+
+def _goal_judge_timeout() -> float:
+    """Resolve auxiliary.goal_judge.timeout, falling back to the default.
+
+    Mirrors ``_goal_judge_max_tokens`` so a slow / reasoning judge model can be
+    given more time via config without code changes. A non-positive or non-float
+    value falls back to the default rather than wedging the goal loop.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        value = (
+            (cfg.get("auxiliary") or {})
+            .get("goal_judge", {})
+            .get("timeout", DEFAULT_JUDGE_TIMEOUT)
+        )
+        value = float(value)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return DEFAULT_JUDGE_TIMEOUT
 
 
 def _parse_judge_response(raw: str) -> Tuple[bool, str, bool]:
@@ -405,13 +493,10 @@ def _parse_judge_response(raw: str) -> Tuple[bool, str, bool]:
     try:
         data = json.loads(text)
     except Exception:
-        # Second try: pull the first JSON object out.
-        match = _JSON_OBJECT_RE.search(text)
-        if match:
-            try:
-                data = json.loads(match.group(0))
-            except Exception:
-                data = None
+        # Second try: pull the first balanced JSON object out. Handles nested
+        # objects and braces inside string values (e.g. a reason like
+        # "need {x} fixed") that the old non-greedy regex truncated.
+        data = _extract_first_json_object(text)
 
     if not isinstance(data, dict):
         return False, f"judge reply was not JSON: {_truncate(raw, 200)!r}", True
@@ -431,7 +516,7 @@ def judge_goal(
     goal: str,
     last_response: str,
     *,
-    timeout: float = DEFAULT_JUDGE_TIMEOUT,
+    timeout: Optional[float] = None,
     subgoals: Optional[List[str]] = None,
 ) -> Tuple[str, str, bool]:
     """Ask the auxiliary model whether the goal is satisfied.
@@ -460,8 +545,15 @@ def judge_goal(
         # No substantive reply this turn — almost certainly not done yet.
         return "continue", "empty response (nothing to evaluate)", False
 
+    if timeout is None:
+        timeout = _goal_judge_timeout()
+
     try:
-        from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
+        from agent.auxiliary_client import (
+            extract_content_or_reasoning,
+            get_auxiliary_extra_body,
+            get_text_auxiliary_client,
+        )
     except Exception as exc:
         logger.debug("goal judge: auxiliary client import failed: %s", exc)
         return "continue", "auxiliary client unavailable", False
@@ -513,6 +605,11 @@ def judge_goal(
 
     try:
         raw = resp.choices[0].message.content or ""
+        if not raw:
+            # Reasoning models (DeepSeek-R1, Qwen-QwQ, ...) can return
+            # content=None with the verdict in a structured reasoning field;
+            # reuse the agent loop's extractor instead of treating it as empty.
+            raw = extract_content_or_reasoning(resp) or ""
     except Exception:
         raw = ""
 
@@ -602,11 +699,17 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         return self._state
 
-    def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
+    def resume(
+        self, *, reset_budget: bool = True, extend_turns: Optional[int] = None
+    ) -> Optional[GoalState]:
         if not self._state:
             return None
         self._state.status = "active"
         self._state.paused_reason = None
+        if extend_turns:
+            self._state.max_turns += int(extend_turns)
+            # Extending the budget implies continuing from where we left off.
+            reset_budget = False
         if reset_budget:
             self._state.turns_used = 0
         save_goal(self.session_id, self._state)
@@ -779,7 +882,8 @@ class GoalManager:
                 "reason": reason,
                 "message": (
                     f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used. "
-                    "Use /goal resume to keep going, or /goal clear to stop."
+                    "Use /goal resume for a fresh budget, /goal resume extend N to "
+                    "add N turns, or /goal clear to stop."
                 ),
             }
 
@@ -870,8 +974,11 @@ def run_kanban_goal_loop(
     (reason: str -> None).
 
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
-    outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    outcome is one of ``"completed_by_worker"``, ``"blocked_budget"`` (turn
+    budget exhausted), ``"blocked_unfinalized"`` (judged done but the worker
+    never called kanban_complete after a nudge), ``"blocked_judge_unparseable"``
+    (judge output unparseable N turns in a row), ``"blocked_by_worker"``, or
+    ``"stopped"``.
     """
 
     def _log(msg: str) -> None:
@@ -889,6 +996,7 @@ def run_kanban_goal_loop(
     # The first turn already consumed one unit of budget.
     turns_used = 1
     nudged_to_finalize = False
+    consecutive_parse_failures = 0
 
     while True:
         # Did the worker terminate the task itself this turn?
@@ -910,8 +1018,37 @@ def run_kanban_goal_loop(
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
 
         # Still open — judge whether the latest response satisfies the card.
-        verdict, reason, _parse_failed = judge_goal(goal_text, last_response)
+        verdict, reason, parse_failed = judge_goal(goal_text, last_response)
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+
+        # Backstop: a judge that keeps returning unparseable output is broken —
+        # block for review instead of burning the whole budget on fail-open
+        # continues (mirrors the main loop's consecutive-parse-failure pause).
+        # parse_failed is True only for usable-output failures, not transient
+        # API errors, so a flaky network won't trip this.
+        if parse_failed:
+            consecutive_parse_failures += 1
+        else:
+            consecutive_parse_failures = 0
+        if consecutive_parse_failures >= DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES:
+            _log(
+                f"kanban goal loop: task {task_id} judge unparseable "
+                f"{consecutive_parse_failures} turns in a row; blocking"
+            )
+            try:
+                block_fn(
+                    f"Goal-mode judge returned unparseable output "
+                    f"{consecutive_parse_failures} turns in a row — the judge model "
+                    f"likely can't honor the JSON contract. Set a stricter "
+                    f"auxiliary.goal_judge model."
+                )
+            except Exception as exc:
+                _log(f"kanban goal loop: block_fn failed ({exc})")
+            return {
+                "outcome": "blocked_judge_unparseable",
+                "turns_used": turns_used,
+                "reason": f"judge unparseable {consecutive_parse_failures} turns in a row",
+            }
 
         if verdict == "done":
             if nudged_to_finalize:
@@ -925,7 +1062,7 @@ def run_kanban_goal_loop(
                     )
                 except Exception as exc:
                     _log(f"kanban goal loop: block_fn failed ({exc})")
-                return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "judged done, never finalized"}
+                return {"outcome": "blocked_unfinalized", "turns_used": turns_used, "reason": "judged done, never finalized"}
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
         else:
@@ -968,4 +1105,6 @@ __all__ = [
     "clear_goal",
     "judge_goal",
     "run_kanban_goal_loop",
+    "parse_goal_budget_flag",
+    "parse_resume_flags",
 ]

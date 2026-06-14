@@ -283,8 +283,32 @@ def test_loop_blocks_when_judge_done_but_never_finalizes(monkeypatch):
         max_turns=10,
         first_response="looks done",
     )
-    assert res["outcome"] == "blocked_budget"
+    assert res["outcome"] == "blocked_unfinalized"
     assert "finalize" in blocked["reason"].lower()
+
+
+def test_loop_blocks_on_repeated_judge_parse_failures(monkeypatch):
+    # A weak judge model that returns unparseable output every turn must trip
+    # the consecutive-parse-failure backstop and block for review, rather than
+    # silently burning the whole budget on fail-open continues.
+    def _fake_judge(goal, response, subgoals=None):
+        return "continue", "scripted:parse-fail", True  # parse_failed=True
+
+    monkeypatch.setattr(goals, "judge_goal", _fake_judge)
+    blocked = {}
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t6",
+        goal_text="task",
+        run_turn=lambda p: "more output",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked.update(reason=r),
+        max_turns=20,  # high, so the backstop (not the budget) is what trips
+        first_response="output",
+    )
+    assert res["outcome"] == "blocked_judge_unparseable"
+    assert res["turns_used"] < 20  # blocked before budget exhaustion
+    assert "unparseable" in blocked["reason"].lower()
 
 
 def test_loop_stops_if_task_reclaimed(monkeypatch):

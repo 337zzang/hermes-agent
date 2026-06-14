@@ -218,3 +218,52 @@ class TestInterruptFlagLifecycle:
             "runs — otherwise a prior turn's interrupt state leaks into the "
             "next turn's goal hook decision."
         )
+
+
+class TestPreemption:
+    """A real queued user message preempts the goal continuation; a queued
+    slash command does NOT — otherwise the loop silently stalls (see the
+    docstring in _maybe_continue_goal_after_turn)."""
+
+    def _cli_ready_to_judge(self, sid):
+        cli, mgr = _make_cli_with_goal(sid)
+        # Non-empty assistant reply so the judge WOULD run absent preemption.
+        cli.conversation_history = [{"role": "assistant", "content": "did some work"}]
+        return cli, mgr
+
+    def test_real_user_message_preempts_judge(self, hermes_home):
+        cli, _mgr = self._cli_ready_to_judge("preempt-real")
+        cli._pending_input.put("actually do Y instead")
+        with patch("hermes_cli.goals.judge_goal") as judge_mock:
+            judge_mock.side_effect = AssertionError("judge ran despite a queued user message")
+            cli._maybe_continue_goal_after_turn()
+        # User message untouched; no continuation piled on top.
+        assert list(cli._pending_input.queue) == ["actually do Y instead"]
+
+    def test_slash_command_does_not_preempt(self, hermes_home):
+        cli, _mgr = self._cli_ready_to_judge("preempt-slash")
+        cli._pending_input.put("/subgoal also handle errors")
+        with patch(
+            "hermes_cli.goals.judge_goal",
+            return_value=("continue", "more to do", False),
+        ) as judge_mock:
+            cli._maybe_continue_goal_after_turn()
+        # Judge ran — a queued slash command must not stall the loop.
+        assert judge_mock.called
+
+    def test_mixed_queue_with_real_message_preempts(self, hermes_home):
+        cli, _mgr = self._cli_ready_to_judge("preempt-mixed")
+        cli._pending_input.put("/subgoal x")
+        cli._pending_input.put("real follow-up")
+        with patch("hermes_cli.goals.judge_goal") as judge_mock:
+            judge_mock.side_effect = AssertionError("judge ran despite a queued user message")
+            cli._maybe_continue_goal_after_turn()
+        assert list(cli._pending_input.queue) == ["/subgoal x", "real follow-up"]
+
+    def test_tuple_payload_real_message_preempts(self, hermes_home):
+        cli, _mgr = self._cli_ready_to_judge("preempt-tuple")
+        cli._pending_input.put(("do this with an image", ["img-data"]))
+        with patch("hermes_cli.goals.judge_goal") as judge_mock:
+            judge_mock.side_effect = AssertionError("judge ran despite a queued (text, images) message")
+            cli._maybe_continue_goal_after_turn()
+        assert list(cli._pending_input.queue) == [("do this with an image", ["img-data"])]

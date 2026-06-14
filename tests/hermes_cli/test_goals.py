@@ -68,6 +68,30 @@ class TestParseJudgeResponse:
         assert done is False
         assert reason == "partial"
 
+    def test_json_with_braces_inside_reason_string(self):
+        """Braces inside the reason string must not truncate extraction (regression).
+
+        The old non-greedy ``\\{.*?\\}`` regex stopped at the first ``}`` — here
+        the ``}`` after ``{x}`` — yielding invalid JSON and a false parse failure.
+        """
+        from hermes_cli.goals import _parse_judge_response
+
+        raw = 'Reasoning first. Verdict: {"done": false, "reason": "need {x} fixed first"}'
+        done, reason, parse_failed = _parse_judge_response(raw)
+        assert done is False
+        assert reason == "need {x} fixed first"
+        assert parse_failed is False
+
+    def test_json_with_nested_object_in_prose(self):
+        """A nested object after prose must be extracted whole, not truncated."""
+        from hermes_cli.goals import _parse_judge_response
+
+        raw = 'Thinking... Verdict: {"done": true, "reason": "ok", "meta": {"score": 1}}'
+        done, reason, parse_failed = _parse_judge_response(raw)
+        assert done is True
+        assert reason == "ok"
+        assert parse_failed is False
+
     def test_string_done_values(self):
         from hermes_cli.goals import _parse_judge_response
 
@@ -155,6 +179,53 @@ class TestJudgeGoal:
             verdict, reason, _ = goals.judge_goal("goal", "agent response")
         assert verdict == "done"
         assert reason == "achieved"
+
+    def test_reasoning_only_response_uses_reasoning_fallback(self):
+        """content=None with the verdict in a reasoning field still parses.
+
+        Reasoning models (DeepSeek-R1, Qwen-QwQ, ...) can return content=None
+        with the text in reasoning_content; without the fallback the judge sees
+        an empty body and mis-counts it as a parse failure.
+        """
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        msg = MagicMock(
+            content=None,
+            reasoning=None,
+            reasoning_content='{"done": true, "reason": "done via reasoning"}',
+            reasoning_details=None,
+        )
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=msg)]
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, parse_failed = goals.judge_goal("goal", "agent response")
+        assert verdict == "done"
+        assert reason == "done via reasoning"
+        assert parse_failed is False
+
+    def test_judge_timeout_resolved_from_config(self):
+        """auxiliary.goal_judge.timeout flows through to the judge API call."""
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='{"done": false, "reason": "x"}'))]
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ), patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"goal_judge": {"timeout": 7.5}}},
+        ):
+            goals.judge_goal("goal", "response")
+        _, kwargs = fake_client.chat.completions.create.call_args
+        assert kwargs["timeout"] == 7.5
 
     def test_judge_says_continue(self):
         from hermes_cli import goals
@@ -245,6 +316,38 @@ class TestGoalManager:
         mgr.resume()
         assert mgr.state.status == "active"
         assert mgr.is_active()
+
+    def test_resume_keep_budget_preserves_turns(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="resume-keep")
+        mgr.set("do x", max_turns=10)
+        mgr.state.turns_used = 6
+        mgr.pause()
+        resumed = mgr.resume(reset_budget=False)
+        assert resumed.turns_used == 6
+        assert resumed.status == "active"
+
+    def test_resume_extend_turns_adds_budget_and_keeps_progress(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="resume-ext")
+        mgr.set("do x", max_turns=10)
+        mgr.state.turns_used = 8
+        mgr.pause()
+        resumed = mgr.resume(extend_turns=5)
+        assert resumed.max_turns == 15
+        assert resumed.turns_used == 8  # progress kept when extending
+
+    def test_bare_resume_resets_budget(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="resume-reset")
+        mgr.set("do x", max_turns=10)
+        mgr.state.turns_used = 6
+        mgr.pause()
+        resumed = mgr.resume()
+        assert resumed.turns_used == 0
 
     def test_clear(self, hermes_home):
         from hermes_cli.goals import GoalManager
@@ -756,3 +859,136 @@ class TestStatusLineSubgoalCount:
         mgr.add_subgoal("b")
         line = mgr.status_line()
         assert "2 subgoals" in line
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Pure config/string helpers — fallback guards (incl. the documented
+# reasoning-model truncation regression that max_tokens defends against).
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestPureHelpers:
+    def test_truncate_under_limit_unchanged(self):
+        from hermes_cli.goals import _truncate
+
+        assert _truncate("short", 100) == "short"
+        assert _truncate("", 100) == ""
+
+    def test_truncate_over_limit_appends_marker(self):
+        from hermes_cli.goals import _truncate
+
+        out = _truncate("x" * 50, 10)
+        assert out.startswith("x" * 10)
+        assert out.endswith("… [truncated]")
+
+    def test_goal_judge_max_tokens_from_config(self):
+        from hermes_cli import goals
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"goal_judge": {"max_tokens": 1234}}},
+        ):
+            assert goals._goal_judge_max_tokens() == 1234
+
+    def test_goal_judge_max_tokens_falls_back_on_bad_value(self):
+        from hermes_cli import goals
+
+        for bad in (0, -5, "nope", None):
+            with patch(
+                "hermes_cli.config.load_config",
+                return_value={"auxiliary": {"goal_judge": {"max_tokens": bad}}},
+            ):
+                assert goals._goal_judge_max_tokens() == goals.DEFAULT_JUDGE_MAX_TOKENS
+        with patch("hermes_cli.config.load_config", return_value={}):
+            assert goals._goal_judge_max_tokens() == goals.DEFAULT_JUDGE_MAX_TOKENS
+
+    def test_goal_judge_timeout_from_config(self):
+        from hermes_cli import goals
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"goal_judge": {"timeout": 12.5}}},
+        ):
+            assert goals._goal_judge_timeout() == 12.5
+
+    def test_goal_judge_timeout_falls_back_on_bad_value(self):
+        from hermes_cli import goals
+
+        for bad in (0, -1, "nope", None):
+            with patch(
+                "hermes_cli.config.load_config",
+                return_value={"auxiliary": {"goal_judge": {"timeout": bad}}},
+            ):
+                assert goals._goal_judge_timeout() == goals.DEFAULT_JUDGE_TIMEOUT
+        with patch("hermes_cli.config.load_config", return_value={}):
+            assert goals._goal_judge_timeout() == goals.DEFAULT_JUDGE_TIMEOUT
+
+
+class TestParseGoalBudgetFlag:
+    def test_no_flag_returns_full_text(self):
+        from hermes_cli.goals import parse_goal_budget_flag
+
+        assert parse_goal_budget_flag("ship the feature") == (None, "ship the feature")
+
+    def test_budget_flag_parsed(self):
+        from hermes_cli.goals import parse_goal_budget_flag
+
+        assert parse_goal_budget_flag("--budget 50 ship it") == (50, "ship it")
+
+    def test_turns_alias_parsed(self):
+        from hermes_cli.goals import parse_goal_budget_flag
+
+        assert parse_goal_budget_flag("--turns 5 do the thing") == (5, "do the thing")
+
+    def test_invalid_budget_value_left_intact(self):
+        """A non-int after the flag is not a budget — leave the text untouched."""
+        from hermes_cli.goals import parse_goal_budget_flag
+
+        assert parse_goal_budget_flag("--budget abc do x") == (None, "--budget abc do x")
+
+    def test_non_positive_budget_left_intact(self):
+        from hermes_cli.goals import parse_goal_budget_flag
+
+        assert parse_goal_budget_flag("--budget 0 do x") == (None, "--budget 0 do x")
+
+    def test_flag_only_without_text(self):
+        from hermes_cli.goals import parse_goal_budget_flag
+
+        assert parse_goal_budget_flag("--budget 50") == (50, "")
+
+    def test_flag_not_at_start_is_ignored(self):
+        """Only a leading flag counts — a stray --budget inside the goal stays."""
+        from hermes_cli.goals import parse_goal_budget_flag
+
+        assert parse_goal_budget_flag("fix the --budget parser") == (
+            None,
+            "fix the --budget parser",
+        )
+
+
+class TestParseResumeFlags:
+    def test_bare_resets(self):
+        from hermes_cli.goals import parse_resume_flags
+
+        assert parse_resume_flags("") == (True, None)
+
+    def test_keep_budget(self):
+        from hermes_cli.goals import parse_resume_flags
+
+        assert parse_resume_flags("--keep-budget") == (False, None)
+
+    def test_extend(self):
+        from hermes_cli.goals import parse_resume_flags
+
+        assert parse_resume_flags("extend 5") == (False, 5)
+
+    def test_invalid_extend_falls_back_to_reset(self):
+        from hermes_cli.goals import parse_resume_flags
+
+        assert parse_resume_flags("extend abc") == (True, None)
+        assert parse_resume_flags("extend") == (True, None)
+
+    def test_unknown_flag_falls_back_to_reset(self):
+        from hermes_cli.goals import parse_resume_flags
+
+        assert parse_resume_flags("--whatever") == (True, None)
