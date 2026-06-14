@@ -1816,12 +1816,16 @@ class CLICommandsMixin:
                 _cprint(f"  ⏸ Goal paused: {state.goal}")
             return
 
-        if lower == "resume":
-            state = mgr.resume()
+        if lower == "resume" or lower.startswith("resume "):
+            from hermes_cli.goals import parse_resume_flags
+            reset_budget, extend = parse_resume_flags(arg[len("resume"):])
+            state = mgr.resume(reset_budget=reset_budget, extend_turns=extend)
             if state is None:
                 _cprint(f"  {_DIM}No goal to resume.{_RST}")
             else:
-                _cprint(f"  ▶ Goal resumed: {state.goal}")
+                _cprint(
+                    f"  ▶ Goal resumed ({state.turns_used}/{state.max_turns} turns): {state.goal}"
+                )
                 _cprint(
                     f"  {_DIM}Send any message (or press Enter on an empty prompt "
                     f"is a no-op; type 'continue' to kick it off).{_RST}"

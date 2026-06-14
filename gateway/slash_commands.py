@@ -1585,8 +1585,10 @@ class GatewaySlashCommandsMixin:
                 logger.debug("goal pause: pending continuation cleanup failed: %s", exc)
             return t("gateway.goal.paused", goal=state.goal)
 
-        if lower == "resume":
-            state = mgr.resume()
+        if lower == "resume" or lower.startswith("resume "):
+            from hermes_cli.goals import parse_resume_flags
+            reset_budget, extend = parse_resume_flags(args[len("resume"):])
+            state = mgr.resume(reset_budget=reset_budget, extend_turns=extend)
             if state is None:
                 return t("gateway.goal.no_resume")
             return t("gateway.goal.resumed", goal=state.goal)

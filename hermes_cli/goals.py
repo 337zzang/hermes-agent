@@ -370,6 +370,29 @@ def parse_goal_budget_flag(arg: str) -> Tuple[Optional[int], str]:
     return None, text
 
 
+def parse_resume_flags(arg: str) -> Tuple[bool, Optional[int]]:
+    """Parse ``/goal resume`` modifiers → ``(reset_budget, extend_turns)``.
+
+    - ``""``            → ``(True, None)``   reset the turn budget (default)
+    - ``--keep-budget`` → ``(False, None)``  resume without resetting progress
+    - ``extend N``      → ``(False, N)``     add N turns, keep progress
+    Anything unrecognized falls back to the default reset behavior.
+    """
+    tokens = (arg or "").strip().split()
+    if not tokens:
+        return True, None
+    if tokens[0] == "--keep-budget":
+        return False, None
+    if tokens[0] == "extend" and len(tokens) > 1:
+        try:
+            n = int(tokens[1])
+        except ValueError:
+            return True, None
+        if n > 0:
+            return False, n
+    return True, None
+
+
 def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
     """Return the first balanced JSON object embedded in ``text``, or None.
 
@@ -675,11 +698,17 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         return self._state
 
-    def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
+    def resume(
+        self, *, reset_budget: bool = True, extend_turns: Optional[int] = None
+    ) -> Optional[GoalState]:
         if not self._state:
             return None
         self._state.status = "active"
         self._state.paused_reason = None
+        if extend_turns:
+            self._state.max_turns += int(extend_turns)
+            # Extending the budget implies continuing from where we left off.
+            reset_budget = False
         if reset_budget:
             self._state.turns_used = 0
         save_goal(self.session_id, self._state)
@@ -852,7 +881,8 @@ class GoalManager:
                 "reason": reason,
                 "message": (
                     f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used. "
-                    "Use /goal resume to keep going, or /goal clear to stop."
+                    "Use /goal resume for a fresh budget, /goal resume extend N to "
+                    "add N turns, or /goal clear to stop."
                 ),
             }
 
@@ -1075,4 +1105,5 @@ __all__ = [
     "judge_goal",
     "run_kanban_goal_loop",
     "parse_goal_budget_flag",
+    "parse_resume_flags",
 ]

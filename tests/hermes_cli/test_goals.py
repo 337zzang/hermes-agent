@@ -317,6 +317,38 @@ class TestGoalManager:
         assert mgr.state.status == "active"
         assert mgr.is_active()
 
+    def test_resume_keep_budget_preserves_turns(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="resume-keep")
+        mgr.set("do x", max_turns=10)
+        mgr.state.turns_used = 6
+        mgr.pause()
+        resumed = mgr.resume(reset_budget=False)
+        assert resumed.turns_used == 6
+        assert resumed.status == "active"
+
+    def test_resume_extend_turns_adds_budget_and_keeps_progress(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="resume-ext")
+        mgr.set("do x", max_turns=10)
+        mgr.state.turns_used = 8
+        mgr.pause()
+        resumed = mgr.resume(extend_turns=5)
+        assert resumed.max_turns == 15
+        assert resumed.turns_used == 8  # progress kept when extending
+
+    def test_bare_resume_resets_budget(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="resume-reset")
+        mgr.set("do x", max_turns=10)
+        mgr.state.turns_used = 6
+        mgr.pause()
+        resumed = mgr.resume()
+        assert resumed.turns_used == 0
+
     def test_clear(self, hermes_home):
         from hermes_cli.goals import GoalManager
 
@@ -932,3 +964,31 @@ class TestParseGoalBudgetFlag:
             None,
             "fix the --budget parser",
         )
+
+
+class TestParseResumeFlags:
+    def test_bare_resets(self):
+        from hermes_cli.goals import parse_resume_flags
+
+        assert parse_resume_flags("") == (True, None)
+
+    def test_keep_budget(self):
+        from hermes_cli.goals import parse_resume_flags
+
+        assert parse_resume_flags("--keep-budget") == (False, None)
+
+    def test_extend(self):
+        from hermes_cli.goals import parse_resume_flags
+
+        assert parse_resume_flags("extend 5") == (False, 5)
+
+    def test_invalid_extend_falls_back_to_reset(self):
+        from hermes_cli.goals import parse_resume_flags
+
+        assert parse_resume_flags("extend abc") == (True, None)
+        assert parse_resume_flags("extend") == (True, None)
+
+    def test_unknown_flag_falls_back_to_reset(self):
+        from hermes_cli.goals import parse_resume_flags
+
+        assert parse_resume_flags("--whatever") == (True, None)
