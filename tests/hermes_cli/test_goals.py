@@ -176,6 +176,25 @@ class TestJudgeGoal:
         assert reason == "not yet"
 
 
+class TestGoalAutoStartPolicy:
+    def test_auto_start_config_is_opt_in(self):
+        from hermes_cli.goals import is_goal_auto_start_enabled
+
+        assert is_goal_auto_start_enabled({}) is False
+        assert is_goal_auto_start_enabled({"goals": {"auto_start": {"enabled": False}}}) is False
+        assert is_goal_auto_start_enabled({"goals": {"auto_start": {"enabled": True}}}) is True
+
+    def test_auto_start_text_classifier_is_conservative(self):
+        from hermes_cli.goals import should_auto_start_goal_from_text
+
+        assert should_auto_start_goal_from_text("Fix the failing tests") is True
+        assert should_auto_start_goal_from_text("구현하고 검증해줘") is True
+        assert should_auto_start_goal_from_text("/goal status") is False
+        assert should_auto_start_goal_from_text("[Continuing toward your standing goal]\nGoal: x") is False
+        assert should_auto_start_goal_from_text("What time is it?") is False
+        assert should_auto_start_goal_from_text("yes") is False
+
+
 # ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence
 # ──────────────────────────────────────────────────────────────────────

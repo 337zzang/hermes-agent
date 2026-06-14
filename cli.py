@@ -3583,8 +3583,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._voice_tts_done = threading.Event()
         self._voice_tts_done.set()
 
-        # Status bar visibility (toggled via /statusbar)
-        self._status_bar_visible = True
+        # Status bar visibility (toggled via /statusbar).  Persisted under
+        # display.status_bar so users who hide the footer do not have to repeat
+        # the command in every new session.
+        self._status_bar_visible = bool(CLI_CONFIG.get("display", {}).get("status_bar", True))
         # When True, the input separator rules and the dynamic status bar are
         # hidden until the next user input. Set by _recover_after_resize() so a
         # SIGWINCH cannot stamp a freshly-drawn status bar on top of one that
@@ -7478,7 +7480,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         elif canonical == "statusbar":
             self._status_bar_visible = not self._status_bar_visible
             state = "visible" if self._status_bar_visible else "hidden"
-            self._console_print(f"  Status bar {state}")
+            saved = save_config_value("display.status_bar", self._status_bar_visible)
+            suffix = "" if saved else " (not saved)"
+            self._console_print(f"  Status bar {state}{suffix}")
         elif canonical == "verbose":
             self._toggle_verbose()
         elif canonical == "footer":
@@ -7836,6 +7840,34 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._goal_manager = mgr
         return mgr
 
+    def _maybe_auto_start_goal_for_input(self, message) -> bool:
+        """Start a standing goal for agentic ordinary CLI input.
+
+        Returns True only when a new goal was created.  The current message is
+        still processed as the first turn; do not enqueue a separate kickoff or
+        the request would run twice.
+        """
+        try:
+            from hermes_cli.goals import (
+                is_goal_auto_start_enabled,
+                should_auto_start_goal_from_text,
+            )
+        except Exception as exc:
+            logging.debug("goal auto-start unavailable: %s", exc)
+            return False
+        try:
+            if not is_goal_auto_start_enabled(getattr(self, "config", None) or {}):
+                return False
+            if not should_auto_start_goal_from_text(message):
+                return False
+            mgr = self._get_goal_manager()
+            if mgr is None or mgr.has_goal():
+                return False
+            mgr.set(str(message).strip())
+            return True
+        except Exception as exc:
+            logging.debug("goal auto-start failed: %s", exc)
+            return False
 
 
     def _maybe_continue_goal_after_turn(self) -> None:
@@ -10095,6 +10127,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if isinstance(message, str):
             from run_agent import _sanitize_surrogates
             message = _sanitize_surrogates(message)
+
+        # Optional core goal auto-start.  If enabled and the message looks like
+        # an implementation/debug/verification request, set a standing goal
+        # before this first turn runs.  The post-turn hook drives any needed
+        # continuations, so do not enqueue a duplicate kickoff here.
+        self._maybe_auto_start_goal_for_input(message)
 
         # Add user message to history
         self.conversation_history.append({"role": "user", "content": message})
