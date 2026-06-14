@@ -60,3 +60,44 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
         assert state.max_turns == 7
     finally:
         goals._DB_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_gateway_goal_budget_flag_overrides_max_turns(tmp_path, monkeypatch):
+    """`/goal --budget N <text>` overrides the global goals.max_turns per goal."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("goals:\n  max_turns: 7\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _FakeSessionStore()
+    runner.adapters = {}
+    runner._queued_events = {}
+
+    event = MessageEvent(
+        text="/goal --budget 3 ship the benchmark",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chat-goal-config",
+            chat_type="channel",
+            user_id="user-goal-config",
+        ),
+        message_id="msg-goal-budget",
+    )
+
+    response = await GatewayRunner._handle_goal_command(runner, event)
+
+    try:
+        assert "3-turn budget" in response
+        state = goals.GoalManager("sid-gateway-goal-config").state
+        assert state is not None
+        assert state.max_turns == 3
+        assert state.goal == "ship the benchmark"
+    finally:
+        goals._DB_CACHE.clear()
