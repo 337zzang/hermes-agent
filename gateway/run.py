@@ -7598,14 +7598,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # broken judge never breaks normal message handling.
             try:
                 _final_text = ""
+                _interrupted = False
                 if isinstance(_agent_result, dict):
                     _final_text = str(_agent_result.get("final_response") or "")
+                    _interrupted = bool(_agent_result.get("interrupted"))
                 elif isinstance(_agent_result, str):
                     _final_text = _agent_result
-                # Skip for empty responses (interrupted / errored) — the
-                # judge would almost always say "continue" and we'd loop
-                # on error. Let the user drive the next turn.
-                if _final_text.strip():
+                # Skip empty, non-interrupted responses (transient errors) — the
+                # judge would say "continue" and loop on error. But ALWAYS run the
+                # hook on an interrupted turn so the goal is paused rather than
+                # re-judged on the cancelled partial output (CLI parity).
+                if _final_text.strip() or _interrupted:
                     try:
                         session_entry = self.session_store.get_or_create_session(source)
                     except Exception:
@@ -7615,6 +7618,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
+                            interrupted=_interrupted,
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
@@ -9612,6 +9616,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        interrupted: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -9637,6 +9642,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
         if not mgr.is_active():
+            return
+
+        if interrupted:
+            # The turn was user-cancelled (/stop or a new message mid-run).
+            # Judging the partial output would almost always say "continue" and
+            # re-queue the very work the user cancelled. Pause instead — the
+            # goal stays recoverable via /goal resume (mirrors the CLI Ctrl+C
+            # auto-pause). No continuation is enqueued.
+            try:
+                mgr.pause(reason="user-interrupted")
+            except Exception as exc:
+                logger.debug("goal pause-on-interrupt failed: %s", exc)
+            if source is not None:
+                await self._defer_goal_status_notice_after_delivery(
+                    source,
+                    "⏸ Goal paused — turn interrupted. /goal resume to continue, "
+                    "or /goal clear to stop.",
+                )
             return
 
         decision = mgr.evaluate_after_turn(final_response or "", user_initiated=True)
