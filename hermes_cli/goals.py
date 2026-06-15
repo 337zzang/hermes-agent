@@ -35,7 +35,7 @@ import re
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,9 @@ DEFAULT_JUDGE_TIMEOUT = 30.0
 DEFAULT_JUDGE_MAX_TOKENS = 4096
 # Cap how much of the last response + recent messages we send to the judge.
 _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
+DEFAULT_JUDGE_HISTORY_TURNS = 3
+_JUDGE_RECENT_RESPONSE_LIMIT = 3
+_JUDGE_RECENT_RESPONSE_SNIPPET_CHARS = 1500
 # After this many consecutive judge *parse* failures (empty output / non-JSON),
 # the loop auto-pauses and points the user at the goal_judge config. API /
 # transport errors do NOT count toward this — those are transient. This guards
@@ -118,9 +121,9 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Goal: {goal}\n\n"
     "Additional criteria the user added mid-loop:\n"
     "{subgoals_block}\n\n"
-    "Continue working toward the goal AND all additional criteria. Take "
-    "the next concrete step. If you believe the goal and every "
-    "additional criterion are complete, state so explicitly and stop. "
+    "Continue working toward the goal and any pending additional criteria. "
+    "Take the next concrete step. If you believe the goal and every "
+    "pending criterion are complete, state so explicitly and stop. "
     "If you are blocked and need input from the user, say so clearly "
     "and stop."
 )
@@ -187,12 +190,11 @@ JUDGE_USER_PROMPT_TEMPLATE = (
 # evaluate ALL of them being met, not just the original goal.
 JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Goal:\n{goal}\n\n"
-    "Additional criteria the user added mid-loop (all must also be "
-    "satisfied for the goal to be DONE):\n{subgoals_block}\n\n"
+    "Additional criteria status:\n{subgoals_block}\n\n"
     "Agent's most recent response:\n{response}\n\n"
     "{background_block}"
     "Current time: {current_time}\n\n"
-    "Decision: For each numbered criterion above, find concrete "
+    "Decision: For each PENDING numbered criterion above, find concrete "
     "evidence in the agent's response that the criterion is "
     "satisfied. Do not accept generic phrases like 'all requirements "
     "met' or 'implying it was done' — require specific evidence (a "
@@ -201,6 +203,31 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "is NOT done — return CONTINUE (or WAIT if blocked on a listed "
     "background process).\n\n"
     "Is the goal AND every additional criterion satisfied?"
+)
+
+
+JUDGE_USER_PROMPT_WITH_HISTORY_TEMPLATE = (
+    "Goal:\n{goal}\n\n"
+    "{subgoals_section}"
+    "Recent assistant progress (oldest to newest, up to 3 turns):\n"
+    "{recent_responses_block}\n\n"
+    "Agent's most recent response:\n{response}\n\n"
+    "Current time: {current_time}\n\n"
+    "{decision_instructions}"
+    "Is the goal satisfied?"
+)
+
+
+AUTO_DECOMPOSE_SYSTEM_PROMPT = (
+    "You decompose a user's standing goal into concrete, verifiable "
+    "subgoals. Reply only with one JSON object."
+)
+
+AUTO_DECOMPOSE_USER_PROMPT_TEMPLATE = (
+    "Decompose this goal into 3-7 verifiable subgoals. Each subgoal must "
+    "be short, concrete, and independently checkable. Reply as JSON exactly "
+    "like {\"subgoals\": [\"...\"]}.\n\n"
+    "Goal:\n{goal}"
 )
 
 
@@ -443,6 +470,58 @@ def should_auto_start_goal_from_text(text: Any) -> bool:
 # Dataclass
 # ──────────────────────────────────────────────────────────────────────
 
+SubgoalValue = Union[str, Dict[str, Any]]
+SubgoalRecord = Dict[str, str]
+_VALID_SUBGOAL_STATUSES = {"pending", "done"}
+
+
+def _normalize_subgoal(value: SubgoalValue) -> Optional[SubgoalRecord]:
+    if isinstance(value, dict):
+        text = str(value.get("text") or "").strip()
+        status = str(value.get("status") or "pending").strip().lower()
+    else:
+        text = str(value or "").strip()
+        status = "pending"
+    if not text:
+        return None
+    if status not in _VALID_SUBGOAL_STATUSES:
+        status = "pending"
+    return {"text": text, "status": status}
+
+
+def _normalize_subgoals(raw_subgoals: Any) -> List[SubgoalRecord]:
+    if not isinstance(raw_subgoals, list):
+        return []
+    normalized: List[SubgoalRecord] = []
+    for item in raw_subgoals:
+        subgoal = _normalize_subgoal(item)
+        if subgoal is not None:
+            normalized.append(subgoal)
+    return normalized
+
+
+def _subgoal_text(subgoal: SubgoalValue) -> str:
+    normalized = _normalize_subgoal(subgoal)
+    return normalized["text"] if normalized else ""
+
+
+def _render_judge_subgoals_block(subgoals: List[SubgoalRecord]) -> str:
+    pending: List[str] = []
+    done: List[str] = []
+    for idx, item in enumerate(subgoals, start=1):
+        text = item["text"]
+        if item["status"] == "done":
+            done.append(f"- {idx}. [✓] {text}")
+        else:
+            pending.append(f"- {idx}. [ ] {text}")
+
+    parts: List[str] = ["Pending criteria to evaluate:"]
+    parts.extend(pending or ["- (none)"])
+    if done:
+        parts.append("Already satisfied criteria (context only):")
+        parts.extend(done)
+    return "\n".join(parts)
+
 
 @dataclass
 class GoalState:
@@ -463,7 +542,7 @@ class GoalState:
     # include them so the agent works toward them and the judge factors
     # them into the verdict. Backwards-compatible: defaults to empty so
     # old state_meta rows load unchanged.
-    subgoals: List[str] = field(default_factory=list)
+    subgoals: List[SubgoalRecord] = field(default_factory=list)
     # Wait barrier: when the agent is blocked on long-running async work
     # (CI poller, build, test run, deploy, rate-limit cooldown) the goal loop
     # PARKS instead of being re-poked every turn into busy-work. Two barrier
@@ -493,6 +572,9 @@ class GoalState:
     # no contract behaves exactly like the original free-form goal.
     contract: GoalContract = field(default_factory=GoalContract)
 
+    def __post_init__(self) -> None:
+        self.subgoals = _normalize_subgoals(self.subgoals)
+
     def to_json(self) -> str:
         data = asdict(self)
         # asdict already recursed GoalContract into a plain dict.
@@ -501,10 +583,6 @@ class GoalState:
     @classmethod
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
-        raw_subgoals = data.get("subgoals") or []
-        subgoals: List[str] = []
-        if isinstance(raw_subgoals, list):
-            subgoals = [str(s).strip() for s in raw_subgoals if str(s).strip()]
         return cls(
             goal=data.get("goal", ""),
             status=data.get("status", "active"),
@@ -516,7 +594,7 @@ class GoalState:
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
             consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
-            subgoals=subgoals,
+            subgoals=_normalize_subgoals(data.get("subgoals") or []),
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
             waiting_until=float(data.get("waiting_until", 0.0) or 0.0),
@@ -537,7 +615,14 @@ class GoalState:
         when no subgoals exist."""
         if not self.subgoals:
             return ""
-        return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
+        lines: List[str] = []
+        for i, item in enumerate(self.subgoals, start=1):
+            marker = "[✓]" if item["status"] == "done" else "[ ]"
+            lines.append(f"- {i}. {marker} {item['text']}")
+        return "\n".join(lines)
+
+    def pending_subgoal_texts(self) -> List[str]:
+        return [item["text"] for item in self.subgoals if item["status"] == "pending"]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -744,6 +829,21 @@ def parse_goal_budget_flag(arg: str) -> Tuple[Optional[int], str]:
     return None, text
 
 
+def parse_goal_decompose_flag(arg: str) -> Tuple[bool, str]:
+    """Split a leading or trailing ``--decompose`` flag off a /goal argument."""
+    text = (arg or "").strip()
+    if not text:
+        return False, ""
+    flag = "--decompose"
+    if text == flag:
+        return True, ""
+    if text.startswith(flag + " "):
+        return True, text[len(flag):].strip()
+    if text.endswith(" " + flag):
+        return True, text[: -len(flag)].strip()
+    return False, text
+
+
 def parse_resume_flags(arg: str) -> Tuple[bool, Optional[int]]:
     """Parse ``/goal resume`` modifiers → ``(reset_budget, extend_turns)``.
 
@@ -765,6 +865,97 @@ def parse_resume_flags(arg: str) -> Tuple[bool, Optional[int]]:
         if n > 0:
             return False, n
     return True, None
+
+
+def _goals_config(config: Optional[Any] = None) -> Dict[str, Any]:
+    if config is not None:
+        if isinstance(config, dict):
+            goals_cfg = config.get("goals") or {}
+            return goals_cfg if isinstance(goals_cfg, dict) else {}
+        if hasattr(config, "goals"):
+            goals_cfg = getattr(config, "goals", {}) or {}
+            return goals_cfg if isinstance(goals_cfg, dict) else {}
+    try:
+        from hermes_cli.config import load_config
+
+        loaded = load_config() or {}
+        goals_cfg = loaded.get("goals") or {}
+    except Exception:
+        goals_cfg = {}
+    return goals_cfg if isinstance(goals_cfg, dict) else {}
+
+
+def goal_judge_history_turns_from_config(config: Optional[Any] = None) -> int:
+    """Resolve goals.judge_history_turns, bounded to the judge prompt cap."""
+    try:
+        value = int(
+            _goals_config(config).get(
+                "judge_history_turns", DEFAULT_JUDGE_HISTORY_TURNS
+            )
+        )
+    except Exception:
+        value = DEFAULT_JUDGE_HISTORY_TURNS
+    if value < 0:
+        return 0
+    return min(value, _JUDGE_RECENT_RESPONSE_LIMIT)
+
+
+def goal_auto_decompose_enabled(config: Optional[Any] = None) -> bool:
+    """Resolve goals.auto_decompose. Missing/malformed config is default-off."""
+    try:
+        return bool(_goals_config(config).get("auto_decompose", False))
+    except Exception:
+        return False
+
+
+def _message_content_to_text(content: Any) -> str:
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in {"text", "output_text"}:
+                parts.append(str(part.get("text") or ""))
+        return "\n".join(p for p in parts if p)
+    return str(content or "")
+
+
+def extract_recent_assistant_responses(
+    messages: Any, *, limit: int = DEFAULT_JUDGE_HISTORY_TURNS
+) -> List[str]:
+    """Return the most recent assistant texts, oldest-to-newest."""
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = DEFAULT_JUDGE_HISTORY_TURNS
+    if limit <= 0 or not isinstance(messages, list):
+        return []
+    limit = min(limit, _JUDGE_RECENT_RESPONSE_LIMIT)
+
+    found: List[str] = []
+    for msg in reversed(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        text = _message_content_to_text(msg.get("content")).strip()
+        if not text:
+            continue
+        found.append(text)
+        if len(found) >= limit:
+            break
+    return list(reversed(found))
+
+
+def _prepare_recent_responses(recent_responses: Optional[List[str]]) -> List[str]:
+    clean = [str(item).strip() for item in (recent_responses or []) if str(item).strip()]
+    return [
+        _truncate(item, _JUDGE_RECENT_RESPONSE_SNIPPET_CHARS)
+        for item in clean[-_JUDGE_RECENT_RESPONSE_LIMIT:]
+    ]
+
+
+def _render_recent_responses_block(recent_responses: List[str]) -> str:
+    return "\n\n".join(
+        f"- Recent {idx}:\n{text}" for idx, text in enumerate(recent_responses, start=1)
+    )
+
 
 def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
     """Return the first balanced JSON object embedded in ``text``, or None.
@@ -978,12 +1169,96 @@ def _render_background_block(background_processes: Optional[List[Dict[str, Any]]
     return JUDGE_BACKGROUND_BLOCK_TEMPLATE.format(background_lines="\n".join(lines))
 
 
+def _decompose_goal_into_subgoals(
+    goal: str, *, timeout: Optional[float] = None
+) -> List[str]:
+    """Ask goal_judge to split a goal into verifiable subgoals.
+
+    Fail-open by returning an empty list on any import/client/API/parse error.
+    """
+    if not goal.strip():
+        return []
+    if timeout is None:
+        timeout = _goal_judge_timeout()
+    try:
+        from agent.auxiliary_client import (
+            extract_content_or_reasoning,
+            get_auxiliary_extra_body,
+            get_text_auxiliary_client,
+        )
+    except Exception as exc:
+        logger.debug("goal decompose: auxiliary client import failed: %s", exc)
+        return []
+
+    try:
+        client, model = get_text_auxiliary_client("goal_judge")
+    except Exception as exc:
+        logger.debug("goal decompose: get_text_auxiliary_client failed: %s", exc)
+        return []
+    if client is None or not model:
+        return []
+
+    create_kwargs = dict(
+        model=model,
+        messages=[
+            {"role": "system", "content": AUTO_DECOMPOSE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": AUTO_DECOMPOSE_USER_PROMPT_TEMPLATE.format(
+                    goal=_truncate(goal, 2000)
+                ),
+            },
+        ],
+        temperature=0,
+        max_tokens=_goal_judge_max_tokens(),
+        timeout=timeout,
+        extra_body=get_auxiliary_extra_body() or None,
+    )
+    try:
+        try:
+            resp = client.chat.completions.create(
+                **create_kwargs, response_format={"type": "json_object"}
+            )
+        except Exception as fmt_exc:
+            logger.debug(
+                "goal decompose: response_format rejected (%s) — retrying without it",
+                fmt_exc,
+            )
+            resp = client.chat.completions.create(**create_kwargs)
+    except Exception as exc:
+        logger.info("goal decompose: API call failed (%s)", exc)
+        return []
+
+    try:
+        raw = resp.choices[0].message.content or ""
+        if not raw:
+            raw = extract_content_or_reasoning(resp) or ""
+    except Exception:
+        raw = ""
+
+    data = _extract_first_json_object(raw)
+    if not isinstance(data, dict):
+        return []
+    raw_subgoals = data.get("subgoals")
+    if not isinstance(raw_subgoals, list):
+        return []
+    subgoals: List[str] = []
+    for item in raw_subgoals:
+        text = str(item or "").strip()
+        if text:
+            subgoals.append(_truncate(text, 300))
+        if len(subgoals) >= 7:
+            break
+    return subgoals
+
+
 def judge_goal(
     goal: str,
     last_response: str,
     *,
     timeout: Optional[float] = None,
-    subgoals: Optional[List[str]] = None,
+    recent_responses: Optional[List[str]] = None,
+    subgoals: Optional[List[SubgoalValue]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
@@ -1011,6 +1286,9 @@ def judge_goal(
     — a contract, subgoals, and a background-process list can coexist in one
     judge prompt; when none are set, behavior is identical to the original
     free-form judge.
+
+    ``recent_responses`` optionally supplies recent assistant turns as
+    supporting context. It is capped at 3 entries, 1500 chars each.
 
     This is deliberately fail-open: any error returns ``("continue", ..., False, None)``
     so a broken judge doesn't wedge progress — the turn budget and the
@@ -1044,11 +1322,9 @@ def judge_goal(
     if client is None or not model:
         return "continue", "no auxiliary client configured", False, None
 
-    # Build the prompt. Priority: contract > subgoals > plain. When both a
-    # contract and subgoals exist, the subgoals are appended into the
-    # contract block as extra criteria so the judge sees a single source of
-    # truth.
-    clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
+    # Build the prompt — pick contract/history/subgoal variants.
+    clean_subgoals = _normalize_subgoals(subgoals or [])
+    clean_recent = _prepare_recent_responses(recent_responses)
     background_block = _render_background_block(background_processes)
     current_time = datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
@@ -1067,13 +1343,37 @@ def judge_goal(
             background_block=background_block,
             current_time=current_time,
         )
-    elif clean_subgoals:
-        subgoals_block = "\n".join(
-            f"- {i}. {text}" for i, text in enumerate(clean_subgoals, start=1)
+    elif clean_recent:
+        subgoals_section = ""
+        decision_instructions = (
+            "Decision: Use the recent progress as supporting context, but "
+            "require concrete evidence that the goal is now complete, fully "
+            "delivered, or explicitly blocked.\n\n"
         )
+        if clean_subgoals:
+            subgoals_section = (
+                "Additional criteria status:\n"
+                f"{_render_judge_subgoals_block(clean_subgoals)}\n\n"
+            )
+            decision_instructions = (
+                "Decision: Use the recent progress as supporting context. "
+                "Evaluate the original goal and every PENDING criterion above. "
+                "Already satisfied criteria are context only; do not require "
+                "them to be proven again. If any pending criterion lacks "
+                "specific evidence, return CONTINUE.\n\n"
+            )
+        prompt = JUDGE_USER_PROMPT_WITH_HISTORY_TEMPLATE.format(
+            goal=_truncate(goal, 2000),
+            subgoals_section=subgoals_section,
+            recent_responses_block=_render_recent_responses_block(clean_recent),
+            response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+            current_time=current_time,
+            decision_instructions=decision_instructions,
+        )
+    elif clean_subgoals:
         prompt = JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
             goal=_truncate(goal, 2000),
-            subgoals_block=_truncate(subgoals_block, 2000),
+            subgoals_block=_truncate(_render_judge_subgoals_block(clean_subgoals), 2000),
             response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
             background_block=background_block,
             current_time=current_time,
@@ -1311,8 +1611,16 @@ class GoalManager:
 
     # --- mutation -----------------------------------------------------
 
-    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
+    def set(
+        self,
+        goal: str,
+        *,
+        max_turns: Optional[int] = None,
+        auto_decompose: bool = False,
+        contract: Optional[GoalContract] = None,
+    ) -> GoalState:
         goal = (goal or "").strip()
+        decompose_flag, goal = parse_goal_decompose_flag(goal)
         if not goal:
             raise ValueError("goal text is empty")
         state = GoalState(
@@ -1324,6 +1632,16 @@ class GoalManager:
             last_turn_at=0.0,
             contract=contract if contract is not None else GoalContract(),
         )
+        if auto_decompose or decompose_flag or goal_auto_decompose_enabled():
+            try:
+                state.subgoals = [
+                    {"text": text, "status": "pending"}
+                    for text in _decompose_goal_into_subgoals(goal)
+                    if text
+                ]
+            except Exception as exc:
+                logger.debug("goal decompose failed open: %s", exc)
+                state.subgoals = []
         self._state = state
         save_goal(self.session_id, state)
         return state
@@ -1403,7 +1721,7 @@ class GoalManager:
         text = (text or "").strip()
         if not text:
             raise ValueError("subgoal text is empty")
-        self._state.subgoals.append(text)
+        self._state.subgoals.append({"text": text, "status": "pending"})
         save_goal(self.session_id, self._state)
         return text
 
@@ -1418,7 +1736,21 @@ class GoalManager:
             )
         removed = self._state.subgoals.pop(idx)
         save_goal(self.session_id, self._state)
-        return removed
+        return _subgoal_text(removed)
+
+    def mark_subgoal_done(self, index_1based: int) -> str:
+        """Mark a subgoal done by 1-based index. Returns the subgoal text."""
+        if self._state is None or not self.has_goal():
+            raise RuntimeError("no active goal")
+        idx = int(index_1based) - 1
+        if idx < 0 or idx >= len(self._state.subgoals):
+            raise IndexError(
+                f"index out of range (1..{len(self._state.subgoals)})"
+            )
+        self._state.subgoals[idx]["status"] = "done"
+        text = self._state.subgoals[idx]["text"]
+        save_goal(self.session_id, self._state)
+        return text
 
     def clear_subgoals(self) -> int:
         """Wipe all subgoals. Returns the previous count."""
@@ -1560,6 +1892,7 @@ class GoalManager:
         self,
         last_response: str,
         *,
+        recent_responses: Optional[List[str]] = None,
         user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
@@ -1621,6 +1954,7 @@ class GoalManager:
         verdict, reason, parse_failed, wait_directive = judge_goal(
             state.goal,
             last_response,
+            recent_responses=recent_responses,
             subgoals=state.subgoals or None,
             background_processes=background_processes,
             contract=state.contract if state.has_contract() else None,
@@ -1975,10 +2309,12 @@ __all__ = [
     "JUDGE_USER_PROMPT_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",
+    "JUDGE_USER_PROMPT_WITH_HISTORY_TEMPLATE",
     "DRAFT_CONTRACT_SYSTEM_PROMPT",
     "KANBAN_GOAL_CONTINUATION_TEMPLATE",
     "KANBAN_GOAL_FINALIZE_TEMPLATE",
     "DEFAULT_MAX_TURNS",
+    "DEFAULT_JUDGE_HISTORY_TURNS",
     "load_goal",
     "save_goal",
     "clear_goal",
@@ -1986,5 +2322,9 @@ __all__ = [
     "judge_goal",
     "run_kanban_goal_loop",
     "parse_goal_budget_flag",
+    "parse_goal_decompose_flag",
     "parse_resume_flags",
+    "goal_judge_history_turns_from_config",
+    "goal_auto_decompose_enabled",
+    "extract_recent_assistant_responses",
 ]

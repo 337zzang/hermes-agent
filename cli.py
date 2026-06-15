@@ -9273,8 +9273,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Extract the agent's final response for this turn.
         last_response = ""
+        recent_responses = []
         try:
+            from hermes_cli.goals import (
+                extract_recent_assistant_responses,
+                goal_judge_history_turns_from_config,
+            )
+
             hist = self.conversation_history or []
+            history_turns = goal_judge_history_turns_from_config(
+                getattr(self, "config", None) or {}
+            )
+            recent_responses = extract_recent_assistant_responses(
+                hist, limit=history_turns
+            )
             for msg in reversed(hist):
                 if msg.get("role") == "assistant":
                     content = msg.get("content", "")
@@ -9291,6 +9303,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     break
         except Exception:
             last_response = ""
+            recent_responses = []
 
         # Skip judging on empty/whitespace-only responses. These are almost
         # always transient failures (API error, empty stream) where the
@@ -9307,6 +9320,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         decision = mgr.evaluate_after_turn(
             last_response,
+            recent_responses=recent_responses,
             user_initiated=True,
             background_processes=_bg_procs,
         )
