@@ -16857,9 +16857,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 _final_text = ""
                 _interrupted = False
+                _recent_responses: List[str] = []
                 if isinstance(_agent_result, dict):
                     _final_text = str(_agent_result.get("final_response") or "")
                     _interrupted = bool(_agent_result.get("interrupted"))
+                    try:
+                        from hermes_cli.goals import (
+                            extract_recent_assistant_responses,
+                            goal_judge_history_turns_from_config,
+                        )
+
+                        _history_turns = goal_judge_history_turns_from_config(
+                            getattr(self, "config", None)
+                        )
+                        _recent_responses = extract_recent_assistant_responses(
+                            _agent_result.get("messages") or [],
+                            limit=_history_turns,
+                        )
+                    except Exception as _recent_exc:
+                        logger.debug("goal recent history extraction failed: %s", _recent_exc)
                 elif isinstance(_agent_result, str):
                     _final_text = _agent_result
                 # Skip empty, non-interrupted responses (transient errors) — the
@@ -16879,6 +16895,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
+                            recent_responses=_recent_responses,
                             interrupted=_interrupted,
                         )
             except Exception as _goal_exc:
@@ -20388,6 +20405,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        recent_responses: Optional[List[str]] = None,
         interrupted: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
@@ -20452,6 +20470,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
                 final_response or "",
+                recent_responses=recent_responses,
                 user_initiated=True,
                 background_processes=_bg_procs,
             ),

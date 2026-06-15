@@ -32,6 +32,10 @@ def hermes_home(tmp_path, monkeypatch):
     goals._DB_CACHE.clear()
 
 
+def _sg(text: str, status: str = "pending") -> dict:
+    return {"text": text, "status": status}
+
+
 # ──────────────────────────────────────────────────────────────────────
 # _parse_judge_response
 # ──────────────────────────────────────────────────────────────────────
@@ -255,6 +259,101 @@ class TestJudgeGoal:
         assert verdict == "continue"
         assert reason == "not yet"
 
+    def test_judge_includes_recent_responses_when_provided(self, hermes_home):
+        from hermes_cli import goals
+
+        captured = {}
+        fake_client = MagicMock()
+
+        def _create(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(
+                choices=[MagicMock(message=MagicMock(content='{"done": false, "reason": "x"}'))]
+            )
+
+        fake_client.chat.completions.create.side_effect = _create
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            goals.judge_goal(
+                "ship it",
+                "current turn",
+                recent_responses=["prior turn", "current turn"],
+            )
+
+        user_msg = next(
+            m["content"] for m in captured["messages"] if m["role"] == "user"
+        )
+        assert "Recent assistant progress" in user_msg
+        assert "prior turn" in user_msg
+        assert "current turn" in user_msg
+        assert "Agent's most recent response" in user_msg
+
+    def test_judge_recent_responses_are_capped_and_truncated(self, hermes_home):
+        from hermes_cli import goals
+
+        captured = {}
+        fake_client = MagicMock()
+
+        def _create(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(
+                choices=[MagicMock(message=MagicMock(content='{"done": false, "reason": "x"}'))]
+            )
+
+        fake_client.chat.completions.create.side_effect = _create
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            goals.judge_goal(
+                "ship it",
+                "current",
+                recent_responses=["drop me", "keep 1", "k" * 2000, "keep 3"],
+            )
+
+        user_msg = next(
+            m["content"] for m in captured["messages"] if m["role"] == "user"
+        )
+        assert "drop me" not in user_msg
+        assert "keep 1" in user_msg
+        assert "keep 3" in user_msg
+        assert "… [truncated]" in user_msg
+
+    def test_judge_history_with_subgoals_includes_pending_and_done(self, hermes_home):
+        from hermes_cli import goals
+
+        captured = {}
+        fake_client = MagicMock()
+
+        def _create(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(
+                choices=[MagicMock(message=MagicMock(content='{"done": true, "reason": "ok"}'))]
+            )
+
+        fake_client.chat.completions.create.side_effect = _create
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            goals.judge_goal(
+                "ship it",
+                "current",
+                recent_responses=["prior"],
+                subgoals=[_sg("already", "done"), _sg("remaining")],
+            )
+
+        user_msg = next(
+            m["content"] for m in captured["messages"] if m["role"] == "user"
+        )
+        assert "Recent assistant progress" in user_msg
+        assert "Pending criteria" in user_msg
+        assert "2. [ ] remaining" in user_msg
+        assert "Already satisfied" in user_msg
+        assert "1. [✓] already" in user_msg
+
 
 class TestGoalAutoStartPolicy:
     def test_auto_start_config_is_opt_in(self):
@@ -339,6 +438,65 @@ class TestGoalManager:
         assert "active" in mgr.status_line().lower()
         assert "port the thing" in mgr.status_line()
 
+    def test_set_auto_decompose_default_off(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="test-auto-decompose-off")
+        with patch.object(
+            goals,
+            "_decompose_goal_into_subgoals",
+            side_effect=AssertionError("auto-decompose should be off by default"),
+        ):
+            state = mgr.set("port the thing")
+        assert state.subgoals == []
+
+    def test_set_auto_decompose_on_populates_pending_subgoals(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="test-auto-decompose-on")
+        with patch.object(
+            goals,
+            "_decompose_goal_into_subgoals",
+            return_value=["write tests", "update docs", "verify"],
+        ):
+            state = mgr.set("port the thing", auto_decompose=True)
+        assert state.subgoals == [
+            _sg("write tests"),
+            _sg("update docs"),
+            _sg("verify"),
+        ]
+
+    def test_set_decompose_flag_cleans_goal_and_populates_subgoals(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="test-auto-decompose-flag")
+        with patch.object(
+            goals,
+            "_decompose_goal_into_subgoals",
+            return_value=["one", "two", "three"],
+        ):
+            state = mgr.set("ship the feature --decompose")
+        assert state.goal == "ship the feature"
+        assert state.subgoals == [_sg("one"), _sg("two"), _sg("three")]
+
+    def test_set_auto_decompose_failure_fails_open(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="test-auto-decompose-fail")
+        with patch.object(
+            goals,
+            "_decompose_goal_into_subgoals",
+            side_effect=RuntimeError("judge down"),
+        ):
+            state = mgr.set("ship the feature", auto_decompose=True)
+        assert state.subgoals == []
+
+    def test_set_rejects_empty(self, hermes_home):
+        from hermes_cli.goals import GoalManager
 
 
 
@@ -726,7 +884,31 @@ class TestGoalStateSubgoalsBackcompat:
         from hermes_cli.goals import GoalState
         state = GoalState(goal="g", subgoals=["a", "b", "c"])
         rt = GoalState.from_json(state.to_json())
-        assert rt.subgoals == ["a", "b", "c"]
+        assert rt.subgoals == [_sg("a"), _sg("b"), _sg("c")]
+
+    def test_legacy_string_subgoals_promote_to_pending_dicts(self):
+        from hermes_cli.goals import GoalState
+
+        legacy = json.dumps({
+            "goal": "do a thing",
+            "status": "active",
+            "turns_used": 0,
+            "max_turns": 20,
+            "created_at": 1.0,
+            "last_turn_at": 2.0,
+            "subgoals": ["old str sub"],
+        })
+        state = GoalState.from_json(legacy)
+        assert state.subgoals == [_sg("old str sub")]
+
+    def test_dict_subgoals_round_trip_status(self):
+        from hermes_cli.goals import GoalState
+
+        state = GoalState(goal="g", subgoals=[_sg("done one", "done"), _sg("todo")])
+        rt = GoalState.from_json(state.to_json())
+        assert rt.subgoals == [_sg("done one", "done"), _sg("todo")]
+        assert "[✓] done one" in rt.render_subgoals_block()
+        assert "[ ] todo" in rt.render_subgoals_block()
 
 
 class TestMigrateGoalToSession:
@@ -777,7 +959,7 @@ class TestGoalManagerSubgoals:
         mgr.set("main goal")
         text = mgr.add_subgoal("  use bullet points  ")
         assert text == "use bullet points"
-        assert mgr.state.subgoals == ["use bullet points"]
+        assert mgr.state.subgoals == [_sg("use bullet points")]
 
     def test_add_subgoal_requires_active_goal(self, hermes_home):
         import pytest
@@ -803,7 +985,18 @@ class TestGoalManagerSubgoals:
         mgr.add_subgoal("third")
         removed = mgr.remove_subgoal(2)
         assert removed == "second"
-        assert mgr.state.subgoals == ["first", "third"]
+        assert mgr.state.subgoals == [_sg("first"), _sg("third")]
+
+    def test_mark_subgoal_done(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+        mgr = GoalManager(session_id="sub-done")
+        mgr.set("g")
+        mgr.add_subgoal("first")
+        mgr.add_subgoal("second")
+        marked = mgr.mark_subgoal_done(2)
+        assert marked == "second"
+        assert mgr.state.subgoals == [_sg("first"), _sg("second", "done")]
+        assert "[✓] second" in mgr.render_subgoals()
 
     def test_remove_subgoal_out_of_range(self, hermes_home):
         import pytest
@@ -835,7 +1028,7 @@ class TestGoalManagerSubgoals:
         mgr.add_subgoal("second")
 
         mgr2 = GoalManager(session_id="sub-persist")
-        assert mgr2.state.subgoals == ["first", "second"]
+        assert mgr2.state.subgoals == [_sg("first"), _sg("second")]
 
 
 class TestContinuationPromptWithSubgoals:
@@ -858,8 +1051,8 @@ class TestContinuationPromptWithSubgoals:
         assert prompt is not None
         assert "ship the feature" in prompt
         assert "Additional criteria" in prompt
-        assert "1. write tests" in prompt
-        assert "2. update docs" in prompt
+        assert "1. [ ] write tests" in prompt
+        assert "2. [ ] update docs" in prompt
 
 
 class TestJudgeGoalWithSubgoals:
@@ -895,9 +1088,9 @@ class TestJudgeGoalWithSubgoals:
         sent_messages = captured.get("messages") or []
         user_msg = next((m["content"] for m in sent_messages if m["role"] == "user"), "")
         assert "Additional criteria" in user_msg
-        assert "1. write tests" in user_msg
-        assert "2. update docs" in user_msg
-        assert "every additional criterion" in user_msg
+        assert "1. [ ] write tests" in user_msg
+        assert "2. [ ] update docs" in user_msg
+        assert "PENDING" in user_msg
         assert verdict == "done"
 
     def test_judge_uses_original_template_when_no_subgoals(self, hermes_home):
@@ -1717,6 +1910,29 @@ class TestPureHelpers:
         with patch("hermes_cli.config.load_config", return_value={}):
             assert goals._goal_judge_timeout() == goals.DEFAULT_JUDGE_TIMEOUT
 
+    def test_judge_history_turns_from_config_defaults_and_clamps(self):
+        from hermes_cli.goals import goal_judge_history_turns_from_config
+
+        assert goal_judge_history_turns_from_config({"goals": {}}) == 3
+        assert goal_judge_history_turns_from_config({"goals": {"judge_history_turns": 2}}) == 2
+        assert goal_judge_history_turns_from_config({"goals": {"judge_history_turns": 99}}) == 3
+        assert goal_judge_history_turns_from_config({"goals": {"judge_history_turns": 0}}) == 0
+
+    def test_extract_recent_assistant_responses(self):
+        from hermes_cli.goals import extract_recent_assistant_responses
+
+        messages = [
+            {"role": "assistant", "content": "old"},
+            {"role": "user", "content": "next"},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "middle"}],
+            },
+            {"role": "tool", "content": "ignored"},
+            {"role": "assistant", "content": "new"},
+        ]
+        assert extract_recent_assistant_responses(messages, limit=2) == ["middle", "new"]
+
 
 class TestParseGoalBudgetFlag:
     def test_no_flag_returns_full_text(self):
@@ -1757,6 +1973,32 @@ class TestParseGoalBudgetFlag:
         assert parse_goal_budget_flag("fix the --budget parser") == (
             None,
             "fix the --budget parser",
+        )
+
+
+class TestParseGoalDecomposeFlag:
+    def test_no_flag_returns_text(self):
+        from hermes_cli.goals import parse_goal_decompose_flag
+
+        assert parse_goal_decompose_flag("ship the feature") == (
+            False,
+            "ship the feature",
+        )
+
+    def test_leading_flag(self):
+        from hermes_cli.goals import parse_goal_decompose_flag
+
+        assert parse_goal_decompose_flag("--decompose ship the feature") == (
+            True,
+            "ship the feature",
+        )
+
+    def test_trailing_flag(self):
+        from hermes_cli.goals import parse_goal_decompose_flag
+
+        assert parse_goal_decompose_flag("ship the feature --decompose") == (
+            True,
+            "ship the feature",
         )
 
 

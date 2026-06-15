@@ -54,6 +54,7 @@ def _make_cli_with_goal(session_id: str, goal_text: str = "build a thing"):
     cli.session_id = session_id
     cli.agent = MagicMock()
     cli.agent.session_id = session_id
+    cli.config = {}
 
     mgr = GoalManager(session_id=session_id, default_max_turns=5)
     mgr.set(goal_text)
@@ -128,6 +129,27 @@ class TestHealthyTurnStillRuns:
 
         assert cli._pending_input.empty()
         assert mgr.state.status == "done"
+
+    def test_clean_response_passes_recent_assistant_history(self, hermes_home):
+        sid = f"sid-recent-{uuid.uuid4().hex}"
+        cli, _mgr = _make_cli_with_goal(sid)
+        cli.config = {"goals": {"judge_history_turns": 2}}
+        cli._last_turn_interrupted = False
+        cli.conversation_history = [
+            {"role": "assistant", "content": "older"},
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": "middle"},
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": "newest"},
+        ]
+
+        with patch(
+            "hermes_cli.goals.judge_goal",
+            return_value=("continue", "needs more", False),
+        ) as judge_mock:
+            cli._maybe_continue_goal_after_turn()
+
+        assert judge_mock.call_args.kwargs["recent_responses"] == ["middle", "newest"]
 
 
 class TestInterruptFlagLifecycle:

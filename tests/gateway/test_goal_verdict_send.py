@@ -125,6 +125,29 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
 
 
 @pytest.mark.asyncio
+async def test_goal_verdict_passes_recent_responses_to_judge(hermes_home):
+    runner, _adapter, session_entry, src = _make_runner_with_adapter()
+
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("polish the docs")
+
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("done", "complete", False),
+    ) as judge_mock:
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="newest",
+            recent_responses=["middle", "newest"],
+        )
+        await asyncio.sleep(0.05)
+
+    assert judge_mock.call_args.kwargs["recent_responses"] == ["middle", "newest"]
+
+
+@pytest.mark.asyncio
 async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     """When the budget is exhausted, a '⏸ Goal paused' message must be sent
     and no further continuation enqueued."""
