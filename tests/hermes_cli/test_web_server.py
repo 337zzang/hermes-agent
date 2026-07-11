@@ -251,9 +251,11 @@ class TestWebServerEndpoints:
 
         import hermes_state
         from hermes_constants import get_hermes_home
+        import hermes_cli.web_server as web_server
         from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
 
         monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
+        web_server._realtime_secret_timestamps.clear()
 
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
@@ -1071,6 +1073,430 @@ class TestWebServerEndpoints:
 
 
 
+    def test_search_dedupes_compression_lineage_to_tip(self):
+        """A conversation that auto-compresses leaves the matched term in both
+        the root segment and the continuation. Search must collapse them to a
+        single result keyed by the lineage root and pointing at the live tip,
+        so the sidebar stops showing the same chat several times."""
+        import time as _time
+
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="search-root", source="cli")
+            db.append_message(session_id="search-root", role="user", content="distinctneedle in the root")
+            db.end_session("search-root", "compression")
+            now = _time.time()
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+                (now - 100, now - 90, "search-root"),
+            )
+            db.create_session(session_id="search-tip", source="cli", parent_session_id="search-root")
+            db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 90, "search-tip"))
+            db.append_message(session_id="search-tip", role="user", content="distinctneedle again in the tip")
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/search?q=distinctneedle")
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+
+        lineage_hits = [r for r in results if r.get("lineage_root") == "search-root"]
+        # One conversation -> exactly one result despite two FTS hits.
+        assert len(lineage_hits) == 1
+        hit = lineage_hits[0]
+        # Surfaced under the live tip so clicking resumes the current session.
+        assert hit["session_id"] == "search-tip"
+        assert hit["lineage_root"] == "search-root"
+
+    def test_search_keeps_branch_specific_hits_on_branch(self):
+        """Branch sessions share parent_session_id, but they are not compression
+        continuations. A query that only exists in the branch must open the
+        branch instead of being collapsed back to the parent/root."""
+        import time as _time
+
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            now = _time.time()
+            db.create_session(session_id="branch-parent", source="cli")
+            db.append_message(session_id="branch-parent", role="user", content="ancestor context")
+            db.end_session("branch-parent", "branched")
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+                (now - 100, now - 90, "branch-parent"),
+            )
+            db.create_session(session_id="branch-child", source="cli", parent_session_id="branch-parent")
+            db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 80, "branch-child"))
+            db.append_message(session_id="branch-child", role="user", content="branchspecificneedle only here")
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/search?q=branchspecificneedle")
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+
+        assert any(
+            r["session_id"] == "branch-child" and r.get("lineage_root") == "branch-child"
+            for r in results
+        )
+
+    def test_get_session_messages_follows_compression_tip(self):
+        """Reading a compressed session by its old id should hydrate from the
+        live continuation, matching /resume behavior."""
+        import time as _time
+
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="desktop-root", source="cli")
+            db.append_message(session_id="desktop-root", role="user", content="before compression")
+            db.end_session("desktop-root", "compression")
+            now = _time.time()
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+                (now - 10, now - 5, "desktop-root"),
+            )
+            db.create_session(session_id="desktop-tip", source="cli", parent_session_id="desktop-root")
+            db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 4, "desktop-tip"))
+            db.replace_messages("desktop-root", [])
+            db.append_message(session_id="desktop-tip", role="user", content="after compression")
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/desktop-root/messages")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["session_id"] == "desktop-tip"
+        assert [m["content"] for m in payload["messages"]] == ["after compression"]
+
+    def test_get_sessions_archived_is_boolean(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="bool-arch", source="cli")
+            db.append_message(session_id="bool-arch", role="user", content="hi")
+        finally:
+            db.close()
+
+        row = next(s for s in self.client.get("/api/sessions").json()["sessions"] if s["id"] == "bool-arch")
+        assert row["archived"] is False
+
+    def test_rename_response_omits_archived_when_not_set(self):
+        """Title-only PATCH keeps its legacy {ok, title} response shape."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="title-only", source="cli")
+        finally:
+            db.close()
+
+        resp = self.client.patch("/api/sessions/title-only", json={"title": "Hi"})
+        assert resp.status_code == 200
+        assert "archived" not in resp.json()
+
+    def test_audio_transcription_endpoint(self, monkeypatch):
+        import tools.transcription_tools as transcription_tools
+
+        captured = {}
+
+        def fake_transcribe_audio(path):
+            captured["path"] = path
+            return {
+                "success": True,
+                "transcript": "hello from voice mode",
+                "provider": "test",
+            }
+
+        monkeypatch.setattr(transcription_tools, "transcribe_audio", fake_transcribe_audio)
+
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/webm;base64,aGVsbG8=",
+                "mime_type": "audio/webm",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "ok": True,
+            "transcript": "hello from voice mode",
+            "provider": "test",
+        }
+        assert captured["path"].endswith(".webm")
+        assert not Path(captured["path"]).exists()
+
+    def test_audio_transcription_rejects_invalid_base64(self):
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/webm;base64,not base64",
+                "mime_type": "audio/webm",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "base64" in resp.json()["detail"]
+
+    def test_realtime_voice_session_is_transcription_only_and_redacts_standard_key(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return json.dumps({"value": "ek_ephemeral_only", "expires_at": 2_000_000_000}).encode()
+
+        def fake_urlopen(request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        monkeypatch.setattr(
+            web_server,
+            "load_config",
+            lambda: {"voice": {"input_mode": "realtime", "realtime": {"enabled": True}}},
+        )
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-standard-backend-only")
+        monkeypatch.setattr(web_server.urllib.request, "urlopen", fake_urlopen)
+
+        resp = self.client.post(
+            "/api/audio/realtime/session",
+            json={"session_id": "desktop-session-1", "language": "ko"},
+        )
+
+        assert resp.status_code == 200
+        response_body = resp.json()
+        assert response_body["client_secret"] == "ek_ephemeral_only"
+        assert response_body["expires_at"] == 2_000_000_000
+        assert len(response_body["session_binding"]) == 64
+        assert "sk-standard-backend-only" not in json.dumps(response_body)
+
+        upstream_request = captured["request"]
+        assert upstream_request.full_url == "https://api.openai.com/v1/realtime/client_secrets"
+        assert upstream_request.get_header("Authorization") == "Bearer sk-standard-backend-only"
+        assert len(upstream_request.get_header("Openai-safety-identifier")) == 64
+        assert captured["timeout"] == 10
+
+        upstream_body = json.loads(upstream_request.data)
+        assert upstream_body["expires_after"] == {"anchor": "created_at", "seconds": 60}
+        session = upstream_body["session"]
+        assert session["type"] == "transcription"
+        assert session["audio"]["input"]["transcription"] == {
+            "language": "ko",
+            "model": "gpt-4o-transcribe",
+        }
+        assert session["audio"]["input"]["turn_detection"]["type"] == "server_vad"
+        serialized = json.dumps(upstream_body)
+        assert "response.create" not in serialized
+        assert "tools" not in session
+        assert "tool_choice" not in session
+        assert "output_modalities" not in session
+
+    def test_realtime_voice_session_is_off_by_default(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        called = False
+
+        def fail_urlopen(*_args, **_kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("feature-off route must not reach OpenAI")
+
+        monkeypatch.setattr(web_server, "load_config", lambda: DEFAULT_CONFIG)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-unused")
+        monkeypatch.setattr(web_server.urllib.request, "urlopen", fail_urlopen)
+
+        resp = self.client.post(
+            "/api/audio/realtime/session",
+            json={"session_id": "desktop-session-off"},
+        )
+
+        assert resp.status_code == 409
+        assert called is False
+        assert DEFAULT_CONFIG["voice"]["input_mode"] == "legacy"
+        assert DEFAULT_CONFIG["voice"]["realtime"]["enabled"] is False
+
+    def test_realtime_voice_session_requires_process_key_and_valid_origin(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(
+            web_server,
+            "load_config",
+            lambda: {"voice": {"input_mode": "realtime", "realtime": {"enabled": True}}},
+        )
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        missing_key = self.client.post(
+            "/api/audio/realtime/session",
+            json={"session_id": "desktop-session-no-key"},
+        )
+        assert missing_key.status_code == 503
+
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-backend")
+        bad_origin = self.client.post(
+            "/api/audio/realtime/session",
+            headers={"Origin": "https://evil.example"},
+            json={"session_id": "desktop-session-origin"},
+        )
+        assert bad_origin.status_code == 403
+
+        wrong_port = self.client.post(
+            "/api/audio/realtime/session",
+            headers={"Origin": "http://testserver:9999"},
+            json={"session_id": "desktop-session-port"},
+        )
+        assert wrong_port.status_code == 403
+
+    def test_realtime_voice_session_timeout_is_generic_and_redacted(self, monkeypatch, caplog):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(
+            web_server,
+            "load_config",
+            lambda: {"voice": {"input_mode": "realtime", "realtime": {"enabled": True}}},
+        )
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-timeout-must-stay-private")
+
+        def fail_urlopen(*_args, **_kwargs):
+            raise TimeoutError("sk-timeout-must-stay-private")
+
+        monkeypatch.setattr(web_server.urllib.request, "urlopen", fail_urlopen)
+
+        resp = self.client.post(
+            "/api/audio/realtime/session",
+            json={"session_id": "desktop-session-timeout"},
+        )
+
+        assert resp.status_code == 502
+        assert resp.json() == {"detail": "Could not create Realtime voice session"}
+        assert "sk-timeout-must-stay-private" not in resp.text
+        assert "sk-timeout-must-stay-private" not in caplog.text
+
+    def test_realtime_voice_session_rate_limits_client_and_rejects_extra_payload(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return b'{"value":"ek_test","expires_at":2000000000}'
+
+        monkeypatch.setattr(
+            web_server,
+            "load_config",
+            lambda: {"voice": {"input_mode": "realtime", "realtime": {"enabled": True}}},
+        )
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-backend")
+        monkeypatch.setattr(web_server.urllib.request, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+        monkeypatch.setattr(web_server, "_REALTIME_SECRET_RATE_MAX", 1)
+
+        first = self.client.post(
+            "/api/audio/realtime/session",
+            json={"session_id": "desktop-session-rate"},
+        )
+        second = self.client.post(
+            "/api/audio/realtime/session",
+            json={"session_id": "desktop-session-rate-2"},
+        )
+        extra = self.client.post(
+            "/api/audio/realtime/session",
+            json={"session_id": "desktop-session-other", "api_key": "must-not-be-accepted"},
+        )
+        oversized = self.client.post(
+            "/api/audio/realtime/session",
+            json={"session_id": "x" * 161},
+        )
+
+        assert first.status_code == 200
+        assert second.status_code == 429
+        assert extra.status_code == 422
+        assert oversized.status_code == 422
+
+    def test_realtime_voice_route_requires_dashboard_auth(self):
+        from starlette.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        unauthenticated = TestClient(app)
+        resp = unauthenticated.post(
+            "/api/audio/realtime/session",
+            json={"session_id": "desktop-session-unauthenticated"},
+        )
+        assert resp.status_code == 401
+
+    def test_desktop_audio_routes_registered(self):
+        """All three desktop voice endpoints must exist.
+
+        The renderer (apps/desktop) calls /api/audio/transcribe, /speak, and
+        /elevenlabs/voices. /speak + /voices were silently dropped in a merge
+        once; this guards the contract so a future merge can't lose them
+        without failing CI.
+        """
+        from hermes_cli.web_server import app
+
+        paths = {getattr(r, "path", None) for r in app.routes}
+        assert "/api/audio/transcribe" in paths
+        assert "/api/audio/speak" in paths
+        assert "/api/audio/realtime/session" in paths
+        assert "/api/audio/elevenlabs/voices" in paths
+
+    def test_elevenlabs_voices_unavailable_without_key(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "load_env", lambda: {})
+        monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+
+        resp = self.client.get("/api/audio/elevenlabs/voices")
+        assert resp.status_code == 200
+        assert resp.json() == {"available": False, "voices": []}
+
+    def test_speak_text_returns_base64_data_url(self, monkeypatch, tmp_path):
+        import tools.tts_tool as tts_tool
+
+        audio_file = tmp_path / "speech.mp3"
+        audio_file.write_bytes(b"ID3fake-audio-bytes")
+
+        def fake_tts(text):
+            return json.dumps({
+                "success": True,
+                "file_path": str(audio_file),
+                "provider": "test",
+            })
+
+        monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_tts)
+
+        resp = self.client.post("/api/audio/speak", json={"text": "hello there"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["mime_type"] == "audio/mpeg"
+        assert body["data_url"].startswith("data:audio/mpeg;base64,")
+        assert body["provider"] == "test"
+        # The handler streams the bytes back and removes the temp file.
+        assert not audio_file.exists()
+
+    def test_speak_text_requires_nonempty_text(self):
+        resp = self.client.post("/api/audio/speak", json={"text": "   "})
+        assert resp.status_code == 400
 
     def test_update_hermes_returns_docker_guidance_without_spawning(self, monkeypatch):
         import hermes_cli.web_server as web_server

@@ -51,6 +51,7 @@ import type {
   ProfileSetupCommand,
   ProfileSoul,
   ProfilesResponse,
+  RealtimeVoiceSessionResponse,
   SessionInfo,
   SessionMessage,
   SessionMessagesResponse,
@@ -196,6 +197,7 @@ export type {
   ProjectFolder,
   ProjectInfo,
   ProjectsPayload,
+  RealtimeVoiceSessionResponse,
   RpcEvent,
   SessionCreateResponse,
   SessionInfo,
@@ -1744,6 +1746,20 @@ export function speakText(text: string): Promise<AudioSpeakResponse> {
     // finish. Remote providers and large messages regularly exceed the
     // default 15s Electron backend timeout.
     timeoutMs: audioSpeakRequestTimeoutMs(text)
+  })
+}
+
+export function createRealtimeVoiceSession(
+  sessionId: string,
+  language?: string
+): Promise<RealtimeVoiceSessionResponse> {
+  return window.hermesDesktop.api<RealtimeVoiceSessionResponse>({
+    path: '/api/audio/realtime/session',
+    method: 'POST',
+    body: {
+      session_id: sessionId,
+      ...(language ? { language } : {})
+    }
   })
 }
 

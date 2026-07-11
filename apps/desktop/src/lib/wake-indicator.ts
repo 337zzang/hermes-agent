@@ -1,6 +1,6 @@
 export type WakeIndicatorState = 'capturing' | 'detected' | 'hidden'
 
-export type WakeIndicatorVoiceStatus = 'idle' | 'listening' | 'speaking' | 'thinking' | 'transcribing'
+export type WakeIndicatorVoiceStatus = 'idle' | 'connecting' | 'listening' | 'speaking' | 'thinking' | 'transcribing'
 
 let wakeStartedConversation = false
 let voiceConversationStarted = false

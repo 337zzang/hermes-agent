@@ -1648,6 +1648,20 @@ DEFAULT_CONFIG = {
         # voice chat instead of being sent to the agent. Case-insensitive,
         # surrounding punctuation ignored. Set [] to disable.
         "stop_phrases": ["stop"],
+        # Desktop voice input stays on the existing record/transcribe path
+        # unless the user explicitly selects the experimental Realtime mode.
+        # Realtime is transcription/VAD transport only; Hermes still owns the
+        # conversation, tools, policy, and TTS response.
+        "input_mode": "legacy",       # legacy | realtime
+        "realtime": {
+            "enabled": False,
+            "transcription_model": "gpt-4o-transcribe",
+            "language": "",
+            "client_secret_ttl_seconds": 60,
+            "vad_threshold": 0.5,
+            "prefix_padding_ms": 300,
+            "silence_duration_ms": 500,
+        },
     },
 
     # "Hey Hermes" hands-free wake word. Always-on, on-device hotword

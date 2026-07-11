@@ -9,7 +9,8 @@ import { $voiceConversationStartRequest, takeVoiceConversationStart } from '@/st
 import { resetBrowseState } from '@/store/composer-input-history'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
-import { $autoSpeakReplies, $voiceStopPhrase, setAutoSpeakReplies } from '@/store/voice-prefs'
+import { $messages } from '@/store/session'
+import { $autoSpeakReplies, $voiceInputMode, $voiceStopPhrase, setAutoSpeakReplies } from '@/store/voice-prefs'
 import { resumeWakeAfterVoice } from '@/store/wake-word'
 
 import type { ComposerTarget } from '../focus'
@@ -61,6 +62,7 @@ export function useComposerVoice({
   const { t } = useI18n()
   // A tile's composer speaks ITS transcript, not the primary chat's.
   const { $messages } = useComposerScope()
+  const voiceInputMode = useStore($voiceInputMode)
   const [voiceConversationActive, setVoiceConversationActive] = useState(false)
   const lastSpokenIdRef = useRef<string | null>(null)
   const ownsWakeIndicatorRef = useRef(false)
@@ -134,6 +136,7 @@ export function useComposerVoice({
     busy,
     consumePendingResponse,
     enabled: voiceConversationActive,
+    mode: voiceInputMode,
     onFatalError: () => setVoiceConversationActive(false),
     // Speaking over the model mid-generation interrupts the in-flight turn —
     // the same seam as the Stop button — so the interjection becomes the next
@@ -147,6 +150,7 @@ export function useComposerVoice({
     onSubmit: submitVoiceTurn,
     onTranscribeAudio,
     pendingResponse: pendingTurnResponse,
+    sessionId,
     // Before the conversation opens the mic, wait for any in-flight wake.pause
     // to finish releasing the capture device (see wakePauseBarrierRef).
     beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined
@@ -262,7 +266,15 @@ export function useComposerVoice({
 
   // Explicit start/end for the on-screen conversation controls (the hotkey uses
   // the gated toggle above).
-  const startConversation = useCallback(() => setVoiceConversationActive(true), [])
+  const startConversation = useCallback(() => {
+    if (voiceConversationActive) {
+      void conversation.start()
+
+      return
+    }
+
+    setVoiceConversationActive(true)
+  }, [conversation, voiceConversationActive])
 
   const endConversation = useCallback(() => {
     setVoiceConversationActive(false)
