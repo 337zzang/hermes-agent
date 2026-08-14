@@ -134,7 +134,7 @@ async def test_goal_verdict_passes_recent_responses_to_judge(hermes_home):
 
     with patch(
         "hermes_cli.goals.judge_goal",
-        return_value=("done", "complete", False),
+        return_value=("done", "complete", False, None, False),
     ) as judge_mock:
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,

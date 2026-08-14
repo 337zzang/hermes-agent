@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +22,7 @@ class _FakeSessionStore:
     def __init__(self, session_id: str):
         self.entry = _FakeSessionEntry(session_id)
 
-    def get_or_create_session(self, source):
+    def get_or_create_session(self, source, touch_activity=True):
         return self.entry
 
 
@@ -59,41 +60,44 @@ def _make_event(text: str, *, internal: bool = False):
     )
 
 
-def test_gateway_auto_start_disabled_is_noop(hermes_home):
+@pytest.mark.asyncio
+async def test_gateway_auto_start_disabled_is_noop(hermes_home):
     from hermes_cli.goals import GoalManager
     sid = f"sid-gateway-auto-off-{uuid.uuid4().hex}"
     runner = _make_runner(sid, False)
 
-    assert runner._maybe_auto_start_goal_for_event(
+    assert await runner._maybe_auto_start_goal_for_event(
         _make_event("Debug the worker crash and verify the fix")
     ) is False
     assert GoalManager(sid).state is None
 
 
-def test_gateway_auto_start_sets_goal_for_agentic_message(hermes_home):
+@pytest.mark.asyncio
+async def test_gateway_auto_start_sets_goal_for_agentic_message(hermes_home):
     sid = f"sid-gateway-auto-on-{uuid.uuid4().hex}"
     runner = _make_runner(sid, True)
 
-    assert runner._maybe_auto_start_goal_for_event(
+    assert await runner._maybe_auto_start_goal_for_event(
         _make_event("Debug the worker crash and verify the fix")
     ) is True
-    state = runner._get_goal_manager_for_event(_make_event("noop"))[0].state
+    state = (await runner._get_goal_manager_for_event(_make_event("noop")))[0].state
     assert state is not None
     assert state.status == "active"
     assert state.goal == "Debug the worker crash and verify the fix"
 
 
-def test_gateway_auto_start_skips_commands_internal_and_existing_goal(hermes_home):
+@pytest.mark.asyncio
+async def test_gateway_auto_start_skips_commands_internal_and_existing_goal(hermes_home):
     sid = f"sid-gateway-auto-existing-{uuid.uuid4().hex}"
     runner = _make_runner(sid, True)
-    mgr, _ = runner._get_goal_manager_for_event(_make_event("noop"))
+    mgr, _ = await runner._get_goal_manager_for_event(_make_event("noop"))
     mgr.set("existing goal")
 
-    assert runner._maybe_auto_start_goal_for_event(_make_event("/status")) is False
-    assert runner._maybe_auto_start_goal_for_event(
+    assert await runner._maybe_auto_start_goal_for_event(_make_event("/status")) is False
+    assert await runner._maybe_auto_start_goal_for_event(
         _make_event("Fix the failing tests", internal=True)
     ) is False
-    assert runner._maybe_auto_start_goal_for_event(
+    assert await runner._maybe_auto_start_goal_for_event(
         _make_event("Fix the failing tests")
     ) is False
     assert mgr.state.goal == "existing goal"

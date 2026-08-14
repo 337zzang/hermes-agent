@@ -145,7 +145,7 @@ class TestHealthyTurnStillRuns:
 
         with patch(
             "hermes_cli.goals.judge_goal",
-            return_value=("continue", "needs more", False),
+            return_value=("continue", "needs more", False, None, False),
         ) as judge_mock:
             cli._maybe_continue_goal_after_turn()
 
@@ -200,7 +200,7 @@ class TestPreemption:
         cli._pending_input.put("/subgoal also handle errors")
         with patch(
             "hermes_cli.goals.judge_goal",
-            return_value=("continue", "more to do", False),
+            return_value=("continue", "more to do", False, None, False),
         ) as judge_mock:
             cli._maybe_continue_goal_after_turn()
         # Judge ran — a queued slash command must not stall the loop.

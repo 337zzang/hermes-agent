@@ -193,8 +193,8 @@ def test_loop_blocks_on_repeated_judge_parse_failures(monkeypatch):
     # A weak judge model that returns unparseable output every turn must trip
     # the consecutive-parse-failure backstop and block for review, rather than
     # silently burning the whole budget on fail-open continues.
-    def _fake_judge(goal, response, subgoals=None):
-        return "continue", "scripted:parse-fail", True  # parse_failed=True
+    def _fake_judge(goal, response, subgoals=None, **_kw):
+        return "continue", "scripted:parse-fail", True, None, False  # parse_failed=True
 
     monkeypatch.setattr(goals, "judge_goal", _fake_judge)
     blocked = {}

@@ -20327,7 +20327,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return False
             if not should_auto_start_goal_from_text(getattr(event, "text", None)):
                 return False
-            mgr, _session_entry = self._get_goal_manager_for_event(event)
+            mgr, _session_entry = await self._get_goal_manager_for_event(event)
             if mgr is None or mgr.has_goal():
                 return False
             mgr.set(str(event.text).strip())

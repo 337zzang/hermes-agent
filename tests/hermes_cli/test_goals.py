@@ -78,8 +78,8 @@ class TestParseJudgeResponse:
         from hermes_cli.goals import _parse_judge_response
 
         raw = 'Reasoning first. Verdict: {"done": false, "reason": "need {x} fixed first"}'
-        done, reason, parse_failed = _parse_judge_response(raw)
-        assert done is False
+        verdict, reason, parse_failed, _wd = _parse_judge_response(raw)
+        assert verdict == "continue"
         assert reason == "need {x} fixed first"
         assert parse_failed is False
 
@@ -88,8 +88,8 @@ class TestParseJudgeResponse:
         from hermes_cli.goals import _parse_judge_response
 
         raw = 'Thinking... Verdict: {"done": true, "reason": "ok", "meta": {"score": 1}}'
-        done, reason, parse_failed = _parse_judge_response(raw)
-        assert done is True
+        verdict, reason, parse_failed, _wd = _parse_judge_response(raw)
+        assert verdict == "done"
         assert reason == "ok"
         assert parse_failed is False
 
@@ -168,21 +168,22 @@ class TestJudgeGoal:
         """
         from hermes_cli import goals
 
-        fake_client = MagicMock()
         msg = MagicMock(
             content=None,
             reasoning=None,
             reasoning_content='{"done": true, "reason": "done via reasoning"}',
             reasoning_details=None,
         )
-        fake_client.chat.completions.create.return_value = MagicMock(
+        response = MagicMock(
             choices=[MagicMock(message=msg)]
         )
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
+            "agent.auxiliary_client.call_llm",
+            return_value=response,
         ):
-            verdict, reason, parse_failed = goals.judge_goal("goal", "agent response")
+            verdict, reason, parse_failed, _wd, _tf = goals.judge_goal(
+                "goal", "agent response"
+            )
         assert verdict == "done"
         assert reason == "done via reasoning"
         assert parse_failed is False
@@ -191,60 +192,56 @@ class TestJudgeGoal:
         """auxiliary.goal_judge.timeout flows through to the judge API call."""
         from hermes_cli import goals
 
-        fake_client = MagicMock()
-        fake_client.chat.completions.create.return_value = MagicMock(
+        response = MagicMock(
             choices=[MagicMock(message=MagicMock(content='{"done": false, "reason": "x"}'))]
         )
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
-        ), patch(
+            "agent.auxiliary_client.call_llm",
+            return_value=response,
+        ) as call_mock, patch(
             "hermes_cli.config.load_config",
             return_value={"auxiliary": {"goal_judge": {"timeout": 7.5}}},
         ):
             goals.judge_goal("goal", "response")
-        _, kwargs = fake_client.chat.completions.create.call_args
+        _, kwargs = call_mock.call_args
         assert kwargs["timeout"] == 7.5
 
     def test_judge_requests_json_object_response_format(self):
         """judge_goal asks for a structured JSON response when supported."""
         from hermes_cli import goals
 
-        fake_client = MagicMock()
-        fake_client.chat.completions.create.return_value = MagicMock(
+        response = MagicMock(
             choices=[MagicMock(message=MagicMock(content='{"done": false, "reason": "x"}'))]
         )
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
-        ):
+            "agent.auxiliary_client.call_llm",
+            return_value=response,
+        ) as call_mock:
             goals.judge_goal("goal", "response")
-        _, kwargs = fake_client.chat.completions.create.call_args
-        assert kwargs.get("response_format") == {"type": "json_object"}
+        _, kwargs = call_mock.call_args
+        assert kwargs.get("extra_body") == {"response_format": {"type": "json_object"}}
 
     def test_judge_falls_back_when_response_format_rejected(self):
         """A provider that rejects response_format → retry once without it
         (the freeform-JSON parser still handles the reply)."""
         from hermes_cli import goals
 
-        fake_client = MagicMock()
         good = MagicMock(
             choices=[MagicMock(message=MagicMock(content='{"done": true, "reason": "ok"}'))]
         )
-        fake_client.chat.completions.create.side_effect = [
-            ValueError("response_format is not supported by this model"),
-            good,
-        ]
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
-        ):
-            verdict, reason, _ = goals.judge_goal("goal", "response")
+            "agent.auxiliary_client.call_llm",
+            side_effect=[
+                ValueError("response_format is not supported by this model"),
+                good,
+            ],
+        ) as call_mock:
+            verdict, reason, _, _wd, _tf = goals.judge_goal("goal", "response")
         assert verdict == "done"
         assert reason == "ok"
-        assert fake_client.chat.completions.create.call_count == 2
+        assert call_mock.call_count == 2
         # The fallback retry must not carry response_format.
-        assert "response_format" not in fake_client.chat.completions.create.call_args_list[1].kwargs
+        assert "extra_body" not in call_mock.call_args_list[1].kwargs
 
     def test_judge_says_continue(self):
         from hermes_cli import goals
@@ -263,18 +260,15 @@ class TestJudgeGoal:
         from hermes_cli import goals
 
         captured = {}
-        fake_client = MagicMock()
-
         def _create(**kwargs):
             captured.update(kwargs)
             return MagicMock(
                 choices=[MagicMock(message=MagicMock(content='{"done": false, "reason": "x"}'))]
             )
 
-        fake_client.chat.completions.create.side_effect = _create
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
+            "agent.auxiliary_client.call_llm",
+            side_effect=_create,
         ):
             goals.judge_goal(
                 "ship it",
@@ -294,18 +288,15 @@ class TestJudgeGoal:
         from hermes_cli import goals
 
         captured = {}
-        fake_client = MagicMock()
-
         def _create(**kwargs):
             captured.update(kwargs)
             return MagicMock(
                 choices=[MagicMock(message=MagicMock(content='{"done": false, "reason": "x"}'))]
             )
 
-        fake_client.chat.completions.create.side_effect = _create
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
+            "agent.auxiliary_client.call_llm",
+            side_effect=_create,
         ):
             goals.judge_goal(
                 "ship it",
@@ -325,18 +316,15 @@ class TestJudgeGoal:
         from hermes_cli import goals
 
         captured = {}
-        fake_client = MagicMock()
-
         def _create(**kwargs):
             captured.update(kwargs)
             return MagicMock(
                 choices=[MagicMock(message=MagicMock(content='{"done": true, "reason": "ok"}'))]
             )
 
-        fake_client.chat.completions.create.side_effect = _create
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(fake_client, "judge-model"),
+            "agent.auxiliary_client.call_llm",
+            side_effect=_create,
         ):
             goals.judge_goal(
                 "ship it",
