@@ -26,6 +26,11 @@ _skill_commands_platform: Optional[str] = None
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
+# Large operational skills can carry hundreds of references. Embedding every
+# relative and absolute path in the activation turn defeats progressive
+# disclosure and can outweigh the skill body itself. Keep a small preview;
+# skill_view(name=...) remains the complete on-demand catalog.
+_SKILL_SUPPORTING_FILE_PREVIEW_LIMIT = 12
 
 # ---------------------------------------------------------------------------
 # Skill-scaffolding markers and the canonical extractor.
@@ -363,6 +368,18 @@ def _build_skill_message(
                         supporting.append(rel)
 
     if supporting and skill_dir:
+        # Preserve discovery order while suppressing duplicate paths returned
+        # by overlapping linked-file groups.
+        unique_supporting: list[str] = []
+        seen_supporting: set[str] = set()
+        for entry in supporting:
+            path = str(entry)
+            if path in seen_supporting:
+                continue
+            seen_supporting.add(path)
+            unique_supporting.append(path)
+        supporting_preview = unique_supporting[:_SKILL_SUPPORTING_FILE_PREVIEW_LIMIT]
+        omitted_supporting = len(unique_supporting) - len(supporting_preview)
         try:
             skill_view_target = str(skill_dir.relative_to(SKILLS_DIR))
         except ValueError:
@@ -370,12 +387,18 @@ def _build_skill_message(
             skill_view_target = skill_dir.name
         parts.append("")
         parts.append("[This skill has supporting files:]")
-        for sf in supporting:
+        for sf in supporting_preview:
             parts.append(f"- {sf}  ->  {skill_dir / sf}")
+        if omitted_supporting:
+            parts.append(
+                f"- ... {omitted_supporting} additional files omitted from this "
+                "activation preview."
+            )
         parts.append(
             f'\nLoad any of these with skill_view(name="{skill_view_target}", '
             f'file_path="<path>"), or run scripts directly by absolute path '
-            f"(e.g. `node {skill_dir}/scripts/foo.js`)."
+            f"(e.g. `node {skill_dir}/scripts/foo.js`). Call "
+            f'skill_view(name="{skill_view_target}") to inspect the complete catalog.'
         )
 
     stable_prefix = None
